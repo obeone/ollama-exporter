@@ -1,0 +1,90 @@
+name: Build, Push & Sign
+
+# Build the container image, push it to GHCR and sign it with cosign
+# (keyless / OIDC). Runs on pushes to the default branch, version tags
+# and pull requests (PRs build only, no push/sign).
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # ghcr.io/<owner>/<repo> — lowercased automatically by metadata-action.
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-push-sign:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write       # push image to GHCR
+      id-token: write        # cosign keyless signing via OIDC
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Install cosign so the image can be signed after the push.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Skip the registry login on pull requests (no push needed).
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Derive tags and OCI labels from git refs.
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Keyless signing: cosign uses the workflow's OIDC token, no keys to
+      # manage. Sign by immutable digest so every pushed tag is covered.
+      - name: Sign the published image
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          echo "${TAGS}" | xargs -I {} cosign sign --yes "{}@${DIGEST}"
