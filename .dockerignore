@@ -1,0 +1,25 @@
+# Keep the build context tiny and free of anything not needed at runtime.
+.git
+.github
+.gitignore
+.omc
+.worktrees
+
+# Docs / dashboards — not part of the running service
+README.md
+LICENSE
+dashboard.json
+dashboard_custom.json
+
+# Python / editor cruft
+__pycache__/
+*.pyc
+*.pyo
+.venv
+venv/
+.env
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.idea
+.vscode
