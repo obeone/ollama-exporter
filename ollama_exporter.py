@@ -1,4 +1,5 @@
 import os
+import argparse
 import asyncio
 import httpx
 import json
@@ -9,12 +10,20 @@ from fastapi.responses import StreamingResponse
 import uvicorn
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
-# Configurable Ollama host (via env variable or defaults to localhost)
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+# Default values, overridable via environment variables or CLI arguments.
+# CLI arguments take precedence over environment variables (see parse_args).
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_LISTEN_HOST = "::"  # dual-stack: binds both IPv6 and IPv4
+DEFAULT_LISTEN_PORT = 8000
+DEFAULT_LOG_LEVEL = "INFO"
+
+# Configurable Ollama host. Populated by parse_args(); the env default keeps
+# backward compatibility for code paths that import this module directly.
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 app = FastAPI()
@@ -179,9 +188,66 @@ async def verify_ollama_connection():
         logger.error(f"Failed to connect to Ollama server at {OLLAMA_HOST}: {e}")
         logger.error("Please ensure Ollama is running and accessible at the configured host")
 
+def parse_args(argv=None):
+    """Parse command-line arguments.
+
+    Environment variables provide the defaults so that container deployments
+    keep working without flags, while explicit CLI arguments always win.
+
+    Parameters
+    ----------
+    argv : list of str, optional
+        Argument vector to parse. Defaults to ``sys.argv[1:]`` when ``None``.
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed arguments with ``host``, ``port``, ``ollama_host`` and
+        ``log_level`` attributes.
+    """
+    parser = argparse.ArgumentParser(
+        description="Prometheus exporter and metrics-extracting proxy for Ollama."
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("EXPORTER_HOST", DEFAULT_LISTEN_HOST),
+        help="Address to bind the exporter to "
+             "(default: %(default)s, dual-stack IPv6/IPv4).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("EXPORTER_PORT", DEFAULT_LISTEN_PORT)),
+        help="Port to listen on (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--ollama-host",
+        default=os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST),
+        help="Base URL of the upstream Ollama server (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL).upper(),
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        type=str.upper,
+        help="Logging verbosity (default: %(default)s).",
+    )
+    return parser.parse_args(argv)
+
+
 async def main():
+    """Configure runtime from CLI/env, then start the exporter server."""
+    global OLLAMA_HOST
+    args = parse_args()
+
+    # CLI/env arguments override the module-level defaults set at import time.
+    OLLAMA_HOST = args.ollama_host
+    logger.setLevel(getattr(logging, args.log_level, logging.INFO))
+
     await verify_ollama_connection()
-    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+    config = uvicorn.Config(
+        app, host=args.host, port=args.port, log_level=args.log_level.lower()
+    )
     server = uvicorn.Server(config)
     await server.serve()
 
