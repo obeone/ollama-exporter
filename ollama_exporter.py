@@ -4,6 +4,7 @@ import asyncio
 import httpx
 import json
 import logging
+import socket
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
@@ -16,6 +17,13 @@ DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_LISTEN_HOST = "::"  # dual-stack: binds both IPv6 and IPv4
 DEFAULT_LISTEN_PORT = 8000
 DEFAULT_LOG_LEVEL = "INFO"
+
+# Fallback when the host has no usable IPv6 stack (see bind_listen_socket).
+IPV4_WILDCARD = "0.0.0.0"
+
+# Spellings of the IPv6 wildcard we bind ourselves rather than leaving to
+# uvicorn; any other address is unambiguous and asyncio handles it correctly.
+IPV6_WILDCARDS = frozenset({"::", "[::]", "::0"})
 
 # Configurable Ollama host. Populated by parse_args(); the env default keeps
 # backward compatibility for code paths that import this module directly.
@@ -273,6 +281,56 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def bind_listen_socket(host, port):
+    """Bind the listening socket when the requested host needs special care.
+
+    asyncio sets ``IPV6_V6ONLY`` on every AF_INET6 socket it opens, so letting
+    uvicorn bind ``::`` on its own produces an IPv6-only listener: IPv4 clients,
+    including anything reaching the exporter over ``127.0.0.1``, get a
+    connection refused despite the advertised dual-stack default. Binding here
+    with the option cleared gives a single socket serving both families.
+
+    Parameters
+    ----------
+    host : str
+        Address the exporter was asked to bind. Only the IPv6 wildcard is
+        handled here.
+    port : int
+        TCP port to listen on.
+
+    Returns
+    -------
+    socket.socket or None
+        A bound socket to hand over to uvicorn, or ``None`` when ``host`` is
+        not the IPv6 wildcard and uvicorn can bind it itself.
+    """
+    if host not in IPV6_WILDCARDS:
+        return None
+
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Explicit 0 also overrides a system-wide net.ipv6.bindv6only=1.
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        sock.bind(("::", port))
+    except OSError as exc:
+        # No usable IPv6 stack (kernel with ipv6.disable=1, IPv4-only sandbox):
+        # serve IPv4 rather than refusing to start at all.
+        if sock is not None:
+            sock.close()
+        logger.warning(
+            f"Dual-stack bind on [::]:{port} failed ({exc}), "
+            f"falling back to {IPV4_WILDCARD}:{port}"
+        )
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((IPV4_WILDCARD, port))
+
+    # uvicorn passes the socket to loop.create_server(), which calls listen().
+    return sock
+
+
 async def main():
     """Configure runtime from CLI/env, then start the exporter server."""
     global OLLAMA_HOST
@@ -287,7 +345,16 @@ async def main():
         app, host=args.host, port=args.port, log_level=args.log_level.lower()
     )
     server = uvicorn.Server(config)
-    await server.serve()
+
+    sock = bind_listen_socket(args.host, args.port)
+    if sock is None:
+        await server.serve()
+    else:
+        # serve(sockets=...) skips uvicorn's own bind, so our socket options
+        # survive.
+        families = "IPv6+IPv4" if sock.family == socket.AF_INET6 else "IPv4"
+        logger.info(f"Listening on {sock.getsockname()[0]}:{args.port} ({families})")
+        await server.serve(sockets=[sock])
 
 if __name__ == "__main__":
     try:
