@@ -56,10 +56,17 @@ EXPOSE 8000
 # /metrics is served locally; every other path is proxied to Ollama, so it is
 # the only endpoint that reflects this process being healthy on its own.
 # Uses python (always present) rather than curl/wget (absent from slim).
+# Reads EXPORTER_PORT so the probe follows a port override; a port set only
+# via --port on the command line still needs this env var to stay in sync.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/metrics', timeout=2).status == 200 else 1)"
+  CMD python -c "import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:%s/metrics' % os.getenv('EXPORTER_PORT', '8000'), timeout=2).status == 200 else 1)"
 
 # uvicorn shuts down gracefully on SIGINT.
 STOPSIGNAL SIGINT
 
-CMD ["uvicorn", "ollama_exporter:app", "--host", "0.0.0.0", "--port", "8000"]
+# Go through the module's own CLI instead of calling uvicorn directly: it is
+# what reads the environment, applies the argparse defaults and checks the
+# upstream Ollama connection before serving. Splitting it as ENTRYPOINT/CMD
+# lets `docker run <image> --port 9000 --log-level DEBUG` reach argparse.
+ENTRYPOINT ["python", "ollama_exporter.py"]
+CMD []
