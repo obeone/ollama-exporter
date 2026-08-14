@@ -290,4 +290,10 @@ async def main():
     await server.serve()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # SIGINT (Ctrl-C, or `docker stop` via STOPSIGNAL) is a normal shutdown:
+        # uvicorn already closed the server, so exit quietly instead of letting
+        # the traceback surface and the process report a failure status.
+        logger.info("Shutting down")
