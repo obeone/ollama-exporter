@@ -24,7 +24,14 @@ pip install fastapi uvicorn prometheus_client httpx
 ```sh
 python ollama_exporter.py
 ```
-By default, it connects to `http://localhost:11434` for Ollama.
+By default, it connects to `http://localhost:11434` for Ollama and listens on
+`[::]:8000`, a dual-stack socket reachable over both IPv6 and IPv4.
+
+#### 3. Run the Tests (optional)
+```sh
+pip install -r requirements-dev.txt
+pytest
+```
 
 ### Running with Docker
 
