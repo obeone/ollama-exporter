@@ -39,6 +39,15 @@ docker run -d --name ollama-exporter -p 8000:8000 \
   -e OLLAMA_HOST="http://192.168.1.100:11434" ollama-exporter
 ```
 
+Arguments appended to `docker run` are passed straight to the exporter CLI, so
+the flags of the local install work the same way in a container:
+```sh
+docker run -d --name ollama-exporter -p 9000:9000 ollama-exporter \
+  --ollama-host http://192.168.1.100:11434 --port 9000 --log-level DEBUG
+```
+When overriding the port, also set `-e EXPORTER_PORT=9000` so the container
+healthcheck probes the right one.
+
 ## Prometheus Integration
 
 ### Add to `prometheus.yml`
