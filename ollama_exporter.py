@@ -36,12 +36,30 @@ logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 app = FastAPI()
 
+# Ollama durations span two very different regimes: a cached small-model reply
+# lands in tens of milliseconds, while a cold load of a 23 GB model takes tens
+# of seconds and a long generation runs for minutes. The prometheus_client
+# defaults stop at 10s, which turns every cold load into a +Inf observation and
+# makes the p95 meaningless. These buckets keep sub-second resolution and still
+# reach ten minutes.
+DURATION_BUCKETS = (
+    0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 7.5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300, 600,
+)
+
+# Throughput on a dual-RTX-3090 host comfortably exceeds the old 100 tok/s top
+# bucket, which saturated and reported a p95 of exactly 100. Resolution is kept
+# dense across 10-200 tok/s where the real traffic sits, then coarsens.
+TOKENS_PER_SECOND_BUCKETS = (
+    5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200,
+    250, 300, 400, 500, 750, 1000, 1500,
+)
+
 OLLAMA_CHAT_REQUEST_COUNT = Counter("ollama_requests_total", "Total chat requests", ["model"])
 
-OLLAMA_TOTAL_DURATION =       Histogram("ollama_response_seconds", "Total time spent for the response", ["model"])
-OLLAMA_LOAD_DURATION =        Histogram("ollama_load_duration_seconds", "Time spent loading the model", ["model"])
-OLLAMA_PROMPT_EVAL_DURATION = Histogram("ollama_prompt_eval_duration_seconds", "Time spent evaluating prompt", ["model"])
-OLLAMA_EVAL_DURATION =        Histogram("ollama_eval_duration_seconds", "Time spent generating the response", ["model"])
+OLLAMA_TOTAL_DURATION =       Histogram("ollama_response_seconds", "Total time spent for the response", ["model"], buckets=DURATION_BUCKETS)
+OLLAMA_LOAD_DURATION =        Histogram("ollama_load_duration_seconds", "Time spent loading the model", ["model"], buckets=DURATION_BUCKETS)
+OLLAMA_PROMPT_EVAL_DURATION = Histogram("ollama_prompt_eval_duration_seconds", "Time spent evaluating prompt", ["model"], buckets=DURATION_BUCKETS)
+OLLAMA_EVAL_DURATION =        Histogram("ollama_eval_duration_seconds", "Time spent generating the response", ["model"], buckets=DURATION_BUCKETS)
 
 OLLAMA_PROMPT_EVAL_COUNT = Counter("ollama_tokens_processed_total", "Number of tokens in the prompt", ["model"])
 OLLAMA_EVAL_COUNT =        Counter("ollama_tokens_generated_total", "Number of tokens in the response", ["model"])
@@ -50,8 +68,7 @@ OLLAMA_TOKENS_PER_SECOND = Histogram(
     "ollama_tokens_per_second",
     "Tokens generated per second",
     ["model"],
-    # Use buckets with suitable ranges for tokens/s measurements
-    buckets=[5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+    buckets=TOKENS_PER_SECOND_BUCKETS,
 )
 
 
