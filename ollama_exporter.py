@@ -1,10 +1,14 @@
 """Prometheus exporter and metrics-extracting reverse proxy for Ollama.
 
 The exporter sits in front of an Ollama server: every request is forwarded
-verbatim, while the generation endpoints (``/api/chat``, ``/api/generate``,
-``/api/embed``) additionally have their stats object mined for metrics. A
-background task polls ``/api/ps`` so the resident-model set, its VRAM
-footprint and its ``keep_alive`` countdown are observable too.
+verbatim, while the generation endpoints additionally have their statistics
+mined for metrics. Two schemas are instrumented: Ollama's native endpoints
+(``/api/chat``, ``/api/generate``, ``/api/embed``), whose ndjson replies carry
+a nanosecond stats object, and Ollama's OpenAI-compatible endpoints
+(``/v1/chat/completions``, ``/v1/completions``, ``/v1/embeddings``), whose
+JSON or SSE replies carry a ``usage`` object instead. A background task polls
+``/api/ps`` so the resident-model set, its VRAM footprint and its
+``keep_alive`` countdown are observable too.
 """
 
 import os
@@ -76,8 +80,26 @@ logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 # collapses to a single "other" value: the endpoint label must stay bounded,
 # since a label fed straight from request.url.path is an unbounded cardinality
 # hole the moment a client probes a random URL.
-INSTRUMENTED_ENDPOINTS = frozenset({"/api/chat", "/api/generate", "/api/embed"})
+NATIVE_ENDPOINTS = frozenset({"/api/chat", "/api/generate", "/api/embed"})
+
+# Ollama's OpenAI-compatible surface. Clients that speak the OpenAI protocol
+# (and that is most of them: Open WebUI, LangChain, the openai SDK itself) land
+# here rather than on the native endpoints, so leaving these in the "other"
+# catch-all made the busiest traffic path invisible: a box serving multi-minute
+# generations reported no requests at all for the model doing the work.
+OPENAI_ENDPOINTS = frozenset({
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+})
+
+INSTRUMENTED_ENDPOINTS = NATIVE_ENDPOINTS | OPENAI_ENDPOINTS
 OTHER_ENDPOINT = "other"
+
+# Server-sent events framing used by the OpenAI-compatible streaming replies:
+# one `data: <json>` line per event, the stream closed by `data: [DONE]`.
+SSE_DATA_PREFIX = "data:"
+SSE_DONE_PAYLOAD = "[DONE]"
 
 # Outcome values for the `status` label on ollama_requests_total.
 STATUS_SUCCESS = "success"
@@ -234,6 +256,12 @@ OLLAMA_TOKENS_PER_SECOND = Histogram(
     "Tokens generated per second",
     ["model", "endpoint"],
     buckets=TOKENS_PER_SECOND_BUCKETS,
+)
+
+OLLAMA_USAGE_MISSING = Counter(
+    "ollama_usage_missing_total",
+    "Streaming OpenAI-compatible replies that ended without a usage block",
+    ["model", "endpoint"],
 )
 
 # ---------------------------------------------------------------------------
@@ -452,6 +480,64 @@ def extract_and_record_metrics(response_data, model, endpoint):
         logger.debug(f"Model: {model}, Tokens per Second: {tps:.2f}")
 
 
+def record_openai_usage(usage, model, endpoint, generation_seconds=None):
+    """Record the token counts carried by an OpenAI-compatible ``usage`` object.
+
+    Parameters
+    ----------
+    usage : dict or None
+        The ``usage`` object from a ``/v1/*`` reply, i.e. ``prompt_tokens``,
+        ``completion_tokens`` and ``total_tokens``. Anything that is not a
+        dict is ignored, so a malformed upstream payload cannot take the
+        request down.
+    model : str
+        Model name to label the samples with.
+    endpoint : str
+        Normalised endpoint the request was served on.
+    generation_seconds : float, optional
+        Wall-clock seconds between the first streamed token and the end of the
+        stream, measured by the exporter. Tokens per second is only observed
+        when this is known and positive.
+
+    Notes
+    -----
+    The three duration histograms (``ollama_load_duration_seconds``,
+    ``ollama_prompt_eval_duration_seconds``, ``ollama_eval_duration_seconds``)
+    are deliberately left unobserved on this path. The OpenAI-compatible reply
+    carries no ``load_duration``, ``prompt_eval_duration`` or ``eval_duration``,
+    and there is nothing to derive them from. Observing a zero instead would be
+    worse than observing nothing: it drags every quantile, average and
+    ``rate(_sum)/rate(_count)`` computed downstream towards zero and quietly
+    corrupts the same series the native endpoints populate correctly. An absent
+    observation reads as "not measured here", which is the truth.
+    """
+    if not isinstance(usage, dict):
+        return
+
+    # `or 0` rather than a default: Ollama sends an explicit null for the
+    # fields it has nothing to report, and null does not compare with 0.
+    prompt_tokens = usage.get("prompt_tokens") or 0
+    completion_tokens = usage.get("completion_tokens") or 0
+
+    if prompt_tokens > 0:
+        OLLAMA_PROMPT_EVAL_COUNT.labels(model=model, endpoint=endpoint).inc(prompt_tokens)
+        OLLAMA_PROMPT_TOKENS.labels(model=model, endpoint=endpoint).observe(prompt_tokens)
+        logger.debug(f"Model: {model}, Prompt Tokens: {prompt_tokens}")
+
+    # Embeddings report prompt tokens and nothing else, so they fall out of
+    # this branch on their own: no generated tokens, and no throughput sample
+    # for a call that generates nothing.
+    if completion_tokens > 0:
+        OLLAMA_EVAL_COUNT.labels(model=model, endpoint=endpoint).inc(completion_tokens)
+        OLLAMA_GENERATED_TOKENS.labels(model=model, endpoint=endpoint).observe(completion_tokens)
+        logger.debug(f"Model: {model}, Completion Tokens: {completion_tokens}")
+
+    if completion_tokens > 0 and generation_seconds and generation_seconds > 0:
+        tps = completion_tokens / generation_seconds
+        OLLAMA_TOKENS_PER_SECOND.labels(model=model, endpoint=endpoint).observe(tps)
+        logger.debug(f"Model: {model}, Tokens per Second: {tps:.2f}")
+
+
 def record_request_outcome(model, endpoint, status):
     """Count a finished request under its outcome.
 
@@ -510,6 +596,76 @@ def find_final_chunk(raw_chunk):
         if chunk_json.get("done", False):
             final_chunk_data = chunk_json
     return final_chunk_data
+
+
+def find_usage_block(raw_chunk):
+    """Return the ``usage`` object contained in a server-sent-events chunk.
+
+    The OpenAI-compatible stream is SSE, not the ndjson :func:`find_final_chunk`
+    handles: events are ``data: <json>`` lines and the stream ends with
+    ``data: [DONE]``. When the client asked for usage accounting, the last event
+    before ``[DONE]`` carries the ``usage`` object and an empty ``choices``
+    array. Every ``data:`` line is tried rather than only the last one, since a
+    single network read can hold several events or a fragment of one, and
+    undecodable lines are skipped rather than raised.
+
+    Parameters
+    ----------
+    raw_chunk : bytes
+        Bytes as read from the upstream stream.
+
+    Returns
+    -------
+    dict or None
+        The usage object when this chunk contained the event carrying it,
+        otherwise ``None``.
+    """
+    try:
+        chunk_text = raw_chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        # A multi-byte character straddling two reads. The usage event is pure
+        # ASCII, so the line it belongs to is never the one being truncated.
+        return None
+
+    usage = None
+    for line in chunk_text.splitlines():
+        line = line.strip()
+        if not line.startswith(SSE_DATA_PREFIX):
+            continue
+        payload = line[len(SSE_DATA_PREFIX):].strip()
+        if not payload or payload == SSE_DONE_PAYLOAD:
+            continue
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and isinstance(event.get("usage"), dict):
+            usage = event["usage"]
+    return usage
+
+
+def chunk_carries_sse_data(raw_chunk):
+    """Tell whether a raw chunk contains at least one SSE ``data:`` line.
+
+    Used to time the first token: the upstream may open the stream with SSE
+    comments or blank lines, and an error reply is not SSE at all. Neither
+    should be mistaken for the model having produced something.
+
+    Parameters
+    ----------
+    raw_chunk : bytes
+        Bytes as read from the upstream stream.
+
+    Returns
+    -------
+    bool
+        ``True`` when a ``data:`` line is present in this chunk.
+    """
+    try:
+        chunk_text = raw_chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return any(line.strip().startswith(SSE_DATA_PREFIX) for line in chunk_text.splitlines())
 
 
 async def stream_and_record(endpoint, model, headers, body, params, started):
@@ -663,6 +819,191 @@ async def proxy_and_record(endpoint, model, headers, body, params):
         record_request_outcome(model, endpoint, status)
 
 
+async def stream_openai_and_record(endpoint, model, headers, body, params, started):
+    """Proxy a streaming OpenAI-compatible generation, yielding bytes as they arrive.
+
+    Mirrors :func:`stream_and_record` on the ``/v1/*`` surface: same in-flight
+    accounting, same ``finally`` that turns a client hang-up into
+    ``status="aborted"``, same unbuffered pass-through. What differs is the
+    payload, which is SSE carrying a ``usage`` object rather than ndjson
+    carrying a nanosecond stats object, and therefore what can honestly be
+    recorded from it.
+
+    Parameters
+    ----------
+    endpoint : str
+        Normalised endpoint, also used to build the upstream URL.
+    model : str
+        Model name requested by the client.
+    headers : dict of str to str
+        Headers to forward upstream, already stripped of the ones we rewrite.
+    body : dict
+        JSON request body to forward.
+    params : Mapping
+        Query parameters to forward.
+    started : float
+        ``time.perf_counter()`` reading taken when the request entered the
+        handler, used as the origin for time to first token and for the
+        exporter-measured response time.
+
+    Yields
+    ------
+    bytes
+        Upstream response chunks, forwarded untouched and in order.
+    """
+    in_flight = OLLAMA_REQUESTS_IN_FLIGHT.labels(model=model, endpoint=endpoint)
+    in_flight.inc()
+
+    status = STATUS_SUCCESS
+    first_token_time = None
+    usage = None
+
+    try:
+        async with make_http_client() as client:
+            async with client.stream(
+                "POST",
+                f"{OLLAMA_HOST}{endpoint}",
+                headers=headers,
+                json=body,
+                params=params,
+            ) as response:
+                # An error status still arrives as a stream; classify it here so
+                # the body (an error message rather than SSE) is still forwarded
+                # to the client untouched.
+                status = classify_http_status(response.status_code)
+
+                async for chunk in response.aiter_bytes():
+                    if first_token_time is None and chunk and chunk_carries_sse_data(chunk):
+                        # Measured before the yield: what we want is how long
+                        # Ollama took, not how long the client took to read.
+                        first_token_time = time.perf_counter()
+                        OLLAMA_TIME_TO_FIRST_TOKEN.labels(
+                            model=model, endpoint=endpoint
+                        ).observe(first_token_time - started)
+
+                    yield chunk
+
+                    if chunk:
+                        usage = find_usage_block(chunk) or usage
+
+        ended = time.perf_counter()
+        OLLAMA_TOTAL_DURATION.labels(model=model, endpoint=endpoint).observe(ended - started)
+
+        if usage is not None:
+            # Throughput is measured from the first token rather than from the
+            # start of the request: the prompt evaluation and a cold model load
+            # happen before it, and folding them in would understate generation
+            # speed by an order of magnitude on a large model.
+            generation_seconds = None if first_token_time is None else ended - first_token_time
+            record_openai_usage(usage, model, endpoint, generation_seconds)
+        elif status == STATUS_SUCCESS:
+            # No usage block on a stream that completed normally: the client
+            # did not send `stream_options: {"include_usage": true}`, so its
+            # tokens are simply not counted anywhere. The exporter will not
+            # rewrite the request to force the option, since that would change
+            # the event stream the client receives. Counting the gap instead
+            # keeps the undercount visible rather than silent.
+            OLLAMA_USAGE_MISSING.labels(model=model, endpoint=endpoint).inc()
+            logger.debug(f"No usage block in streaming {endpoint} reply for model {model}")
+    except (asyncio.CancelledError, GeneratorExit):
+        # Starlette cancels the task, then closes the generator, when the
+        # client goes away. Both must be re-raised: swallowing cancellation
+        # leaves the server task in an inconsistent state.
+        status = STATUS_ABORTED
+        logger.debug(f"Client aborted streaming request for model {model}")
+        raise
+    except httpx.HTTPError as exc:
+        status = STATUS_UPSTREAM_ERROR
+        logger.warning(f"Upstream error streaming from Ollama for model {model}: {exc}")
+        raise
+    finally:
+        in_flight.dec()
+        record_request_outcome(model, endpoint, status)
+
+
+async def proxy_openai_and_record(endpoint, model, headers, body, params, started):
+    """Proxy a non-streaming OpenAI-compatible request and record its metrics.
+
+    Covers ``/v1/embeddings``, which never streams, as well as the chat and
+    completion endpoints when the client did not ask for a stream. No time to
+    first token is recorded: there is no first token to time, only a single
+    buffered reply. No tokens-per-second either, for the same reason, since the
+    generation window cannot be separated from the prompt evaluation and the
+    model load that precede it inside one opaque wait.
+
+    Parameters
+    ----------
+    endpoint : str
+        Normalised endpoint, also used to build the upstream URL.
+    model : str
+        Model name requested by the client.
+    headers : dict of str to str
+        Headers to forward upstream.
+    body : dict
+        JSON request body to forward.
+    params : Mapping
+        Query parameters to forward.
+    started : float
+        ``time.perf_counter()`` reading taken when the request entered the
+        handler, used as the origin for the exporter-measured response time.
+
+    Returns
+    -------
+    fastapi.Response
+        The upstream response, with hop-by-hop headers removed.
+
+    Raises
+    ------
+    httpx.HTTPError
+        Propagated after the failure has been counted as
+        ``status="upstream_error"``.
+    """
+    in_flight = OLLAMA_REQUESTS_IN_FLIGHT.labels(model=model, endpoint=endpoint)
+    in_flight.inc()
+
+    status = STATUS_SUCCESS
+    try:
+        async with make_http_client() as client:
+            response = await client.post(
+                f"{OLLAMA_HOST}{endpoint}",
+                headers=headers,
+                json=body,
+                params=params,
+            )
+
+        status = classify_http_status(response.status_code)
+
+        if response.status_code == 200:
+            OLLAMA_TOTAL_DURATION.labels(model=model, endpoint=endpoint).observe(
+                time.perf_counter() - started
+            )
+            try:
+                payload = response.json()
+            except (json.JSONDecodeError, TypeError, ValueError):
+                # A 200 that is not JSON is odd but not fatal: forward it and
+                # let the client decide what to make of it.
+                payload = None
+            if isinstance(payload, dict):
+                record_openai_usage(payload.get("usage"), model, endpoint)
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=sanitize_response_headers(response.headers),
+        )
+    except asyncio.CancelledError:
+        status = STATUS_ABORTED
+        logger.debug(f"Client aborted request for model {model}")
+        raise
+    except httpx.HTTPError as exc:
+        status = STATUS_UPSTREAM_ERROR
+        logger.warning(f"Upstream error talking to Ollama for model {model}: {exc}")
+        raise
+    finally:
+        in_flight.dec()
+        record_request_outcome(model, endpoint, status)
+
+
 @app.get("/metrics")
 def metrics():
     """Expose Prometheus metrics."""
@@ -710,6 +1051,55 @@ async def chat_with_metrics(request: Request):
         )
 
     return await proxy_and_record(endpoint, model, headers, body, request.query_params)
+
+
+@app.post("/v1/chat/completions")
+@app.post("/v1/completions")
+@app.post("/v1/embeddings")
+async def openai_with_metrics(request: Request):
+    """Handle OpenAI-compatible requests with streaming support and metrics extraction.
+
+    Parameters
+    ----------
+    request : fastapi.Request
+        Incoming request on ``/v1/chat/completions``, ``/v1/completions`` or
+        ``/v1/embeddings``.
+
+    Returns
+    -------
+    fastapi.Response or fastapi.responses.StreamingResponse
+        A server-sent-events response when the client asked for a stream, the
+        buffered upstream response otherwise. ``/v1/embeddings`` never streams,
+        since its request body carries no ``stream`` field.
+    """
+    # Taken first thing so time to first token covers everything the client
+    # waits through, body parsing and connection setup included.
+    started = time.perf_counter()
+
+    body = await request.json()
+    model = body.get("model", "unknown")
+    endpoint = normalise_endpoint(request.url.path)
+    is_streaming = body.get("stream", False)
+
+    headers = dict(request.headers)
+    headers.pop("host", None)
+    # Dropped because httpx recomputes them for the re-serialised JSON body.
+    headers.pop("content-length", None)
+    headers.pop("content-type", None)
+
+    if is_streaming:
+        return StreamingResponse(
+            stream_openai_and_record(
+                endpoint, model, headers, body, request.query_params, started
+            ),
+            # SSE, not ndjson: an OpenAI client parses the framing, not just
+            # the payload, and mislabelling it breaks the stream client-side.
+            media_type="text/event-stream",
+        )
+
+    return await proxy_openai_and_record(
+        endpoint, model, headers, body, request.query_params, started
+    )
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
