@@ -1,0 +1,46 @@
+name: Tests
+
+# Run the pytest suite on every pull request and on the default branch.
+# Python 3.11 matches the interpreter the runtime image is built on
+# (see Dockerfile), so a test passing here passes in the published image too.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          # Both files, since requirements-dev.txt only includes the other by
+          # reference and would not change when a runtime pin does.
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # requirements-dev.txt pulls in requirements.txt, so this one install
+      # covers both the runtime dependencies and pytest.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run the test suite
+        run: pytest -q
