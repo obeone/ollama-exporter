@@ -1,3 +1,10 @@
+"""Prometheus exporter and metrics-extracting reverse proxy for Ollama.
+
+The exporter sits in front of an Ollama server: every request is forwarded
+verbatim, while the generation endpoints (``/api/chat``, ``/api/generate``,
+``/api/embed``) additionally have their stats object mined for metrics.
+"""
+
 import os
 import argparse
 import asyncio
@@ -5,11 +12,18 @@ import httpx
 import json
 import logging
 import socket
+import time
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
 import uvicorn
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import (
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
 
 # Default values, overridable via environment variables or CLI arguments.
 # CLI arguments take precedence over environment variables (see parse_args).
@@ -25,6 +39,10 @@ IPV4_WILDCARD = "0.0.0.0"
 # uvicorn; any other address is unambiguous and asyncio handles it correctly.
 IPV6_WILDCARDS = frozenset({"::", "[::]", "::0"})
 
+# Generation can legitimately run for many minutes on a large model, so the
+# proxy timeout is deliberately generous.
+PROXY_TIMEOUT = httpx.Timeout(900.0, read=900.0)
+
 # Configurable Ollama host. Populated by parse_args(); the env default keeps
 # backward compatibility for code paths that import this module directly.
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
@@ -34,7 +52,26 @@ logger = logging.getLogger(__name__)
 LOG_LEVEL = os.getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
+# Paths this exporter instruments. Anything else reaching normalise_endpoint()
+# collapses to a single "other" value: the endpoint label must stay bounded,
+# since a label fed straight from request.url.path is an unbounded cardinality
+# hole the moment a client probes a random URL.
+INSTRUMENTED_ENDPOINTS = frozenset({"/api/chat", "/api/generate", "/api/embed"})
+OTHER_ENDPOINT = "other"
+
+# Outcome values for the `status` label on ollama_requests_total.
+STATUS_SUCCESS = "success"
+STATUS_CLIENT_ERROR = "client_error"
+STATUS_SERVER_ERROR = "server_error"
+STATUS_ABORTED = "aborted"
+STATUS_UPSTREAM_ERROR = "upstream_error"
+
+
 app = FastAPI()
+
+# ---------------------------------------------------------------------------
+# Bucket layouts
+# ---------------------------------------------------------------------------
 
 # Ollama durations span two very different regimes: a cached small-model reply
 # lands in tens of milliseconds, while a cold load of a 23 GB model takes tens
@@ -46,6 +83,12 @@ DURATION_BUCKETS = (
     0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 7.5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300, 600,
 )
 
+# Time to first token is a user-facing latency: anything past a minute is
+# already a failed interaction, so the range stops there.
+TTFT_BUCKETS = (
+    0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5, 7.5, 10, 15, 20, 30, 45, 60,
+)
+
 # Throughput on a dual-RTX-3090 host comfortably exceeds the old 100 tok/s top
 # bucket, which saturated and reported a p95 of exactly 100. Resolution is kept
 # dense across 10-200 tok/s where the real traffic sits, then coarsens.
@@ -54,20 +97,89 @@ TOKENS_PER_SECOND_BUCKETS = (
     250, 300, 400, 500, 750, 1000, 1500,
 )
 
-OLLAMA_CHAT_REQUEST_COUNT = Counter("ollama_requests_total", "Total chat requests", ["model"])
+# Powers of two from a trivial prompt up to the 128k context some models
+# advertise, so KV-cache pressure shows up as a distribution instead of an
+# average derived from a counter.
+TOKEN_COUNT_BUCKETS = (
+    64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072,
+)
 
-OLLAMA_TOTAL_DURATION =       Histogram("ollama_response_seconds", "Total time spent for the response", ["model"], buckets=DURATION_BUCKETS)
-OLLAMA_LOAD_DURATION =        Histogram("ollama_load_duration_seconds", "Time spent loading the model", ["model"], buckets=DURATION_BUCKETS)
-OLLAMA_PROMPT_EVAL_DURATION = Histogram("ollama_prompt_eval_duration_seconds", "Time spent evaluating prompt", ["model"], buckets=DURATION_BUCKETS)
-OLLAMA_EVAL_DURATION =        Histogram("ollama_eval_duration_seconds", "Time spent generating the response", ["model"], buckets=DURATION_BUCKETS)
+# ---------------------------------------------------------------------------
+# Request-scoped metrics
+# ---------------------------------------------------------------------------
 
-OLLAMA_PROMPT_EVAL_COUNT = Counter("ollama_tokens_processed_total", "Number of tokens in the prompt", ["model"])
-OLLAMA_EVAL_COUNT =        Counter("ollama_tokens_generated_total", "Number of tokens in the response", ["model"])
+OLLAMA_CHAT_REQUEST_COUNT = Counter(
+    "ollama_requests_total",
+    "Total generation requests, by outcome",
+    ["model", "endpoint", "status"],
+)
+
+OLLAMA_REQUESTS_IN_FLIGHT = Gauge(
+    "ollama_requests_in_flight",
+    "Generation requests currently being served",
+    ["model", "endpoint"],
+)
+
+OLLAMA_TOTAL_DURATION = Histogram(
+    "ollama_response_seconds",
+    "Total time spent for the response",
+    ["model", "endpoint"],
+    buckets=DURATION_BUCKETS,
+)
+OLLAMA_LOAD_DURATION = Histogram(
+    "ollama_load_duration_seconds",
+    "Time spent loading the model",
+    ["model", "endpoint"],
+    buckets=DURATION_BUCKETS,
+)
+OLLAMA_PROMPT_EVAL_DURATION = Histogram(
+    "ollama_prompt_eval_duration_seconds",
+    "Time spent evaluating prompt",
+    ["model", "endpoint"],
+    buckets=DURATION_BUCKETS,
+)
+OLLAMA_EVAL_DURATION = Histogram(
+    "ollama_eval_duration_seconds",
+    "Time spent generating the response",
+    ["model", "endpoint"],
+    buckets=DURATION_BUCKETS,
+)
+
+OLLAMA_TIME_TO_FIRST_TOKEN = Histogram(
+    "ollama_time_to_first_token_seconds",
+    "Delay between accepting a streaming request and emitting its first bytes",
+    ["model", "endpoint"],
+    buckets=TTFT_BUCKETS,
+)
+
+OLLAMA_PROMPT_EVAL_COUNT = Counter(
+    "ollama_tokens_processed_total",
+    "Number of tokens in the prompt",
+    ["model", "endpoint"],
+)
+OLLAMA_EVAL_COUNT = Counter(
+    "ollama_tokens_generated_total",
+    "Number of tokens in the response",
+    ["model", "endpoint"],
+)
+
+OLLAMA_PROMPT_TOKENS = Histogram(
+    "ollama_prompt_tokens",
+    "Distribution of prompt sizes in tokens",
+    ["model", "endpoint"],
+    buckets=TOKEN_COUNT_BUCKETS,
+)
+OLLAMA_GENERATED_TOKENS = Histogram(
+    "ollama_generated_tokens",
+    "Distribution of response sizes in tokens",
+    ["model", "endpoint"],
+    buckets=TOKEN_COUNT_BUCKETS,
+)
 
 OLLAMA_TOKENS_PER_SECOND = Histogram(
     "ollama_tokens_per_second",
     "Tokens generated per second",
-    ["model"],
+    ["model", "endpoint"],
     buckets=TOKENS_PER_SECOND_BUCKETS,
 )
 
@@ -93,6 +205,29 @@ HOP_BY_HOP_HEADERS = frozenset({
 })
 
 
+def make_http_client(timeout=PROXY_TIMEOUT):
+    """Build the httpx client used to reach the upstream Ollama server.
+
+    Every upstream call goes through this single factory so that tests can
+    monkeypatch it and hand back a client wired to an
+    :class:`httpx.MockTransport`, without the production code carrying any
+    test-only plumbing.
+
+    Parameters
+    ----------
+    timeout : httpx.Timeout, optional
+        Timeout policy for the client. Defaults to the generous proxy timeout
+        suited to long generations.
+
+    Returns
+    -------
+    httpx.AsyncClient
+        An unopened client; callers are expected to use it as a context
+        manager.
+    """
+    return httpx.AsyncClient(timeout=timeout)
+
+
 def sanitize_response_headers(headers):
     """Strip hop-by-hop headers from an upstream response before forwarding.
 
@@ -110,8 +245,60 @@ def sanitize_response_headers(headers):
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
 
 
-def extract_and_record_metrics(response_data, model):
-    """Extract and record metrics from Ollama response data."""
+def normalise_endpoint(path):
+    """Collapse a request path to a bounded `endpoint` label value.
+
+    Parameters
+    ----------
+    path : str
+        Raw path from the incoming request, e.g. ``request.url.path``.
+
+    Returns
+    -------
+    str
+        The path itself when it is one of :data:`INSTRUMENTED_ENDPOINTS`,
+        otherwise :data:`OTHER_ENDPOINT`.
+    """
+    normalised = path.rstrip("/") or "/"
+    return normalised if normalised in INSTRUMENTED_ENDPOINTS else OTHER_ENDPOINT
+
+
+def classify_http_status(status_code):
+    """Map an upstream HTTP status code to a `status` label value.
+
+    Parameters
+    ----------
+    status_code : int
+        Status code returned by Ollama.
+
+    Returns
+    -------
+    str
+        One of :data:`STATUS_SUCCESS`, :data:`STATUS_CLIENT_ERROR` or
+        :data:`STATUS_SERVER_ERROR`. Anything below 400, including the 3xx
+        range Ollama never emits, counts as a success.
+    """
+    if status_code >= 500:
+        return STATUS_SERVER_ERROR
+    if status_code >= 400:
+        return STATUS_CLIENT_ERROR
+    return STATUS_SUCCESS
+
+
+def extract_and_record_metrics(response_data, model, endpoint):
+    """Record the metrics carried by an Ollama stats object.
+
+    Parameters
+    ----------
+    response_data : dict
+        Final (``"done": true``) chunk of a stream, or the whole body of a
+        non-streaming response. Non-dict values are ignored so a malformed
+        upstream payload cannot take the request down.
+    model : str
+        Model name to label the samples with.
+    endpoint : str
+        Normalised endpoint the request was served on.
+    """
     if not isinstance(response_data, dict):
         return
 
@@ -125,101 +312,293 @@ def extract_and_record_metrics(response_data, model):
 
     if total_duration > 0:
         total_duration_seconds = total_duration / 1_000_000_000
-        OLLAMA_TOTAL_DURATION.labels(model=model).observe(total_duration_seconds)
+        OLLAMA_TOTAL_DURATION.labels(model=model, endpoint=endpoint).observe(total_duration_seconds)
         logger.debug(f"Model: {model}, Total Duration: {total_duration_seconds:.2f} seconds")
     if load_duration > 0:
         load_duration_seconds = load_duration / 1_000_000_000
-        OLLAMA_LOAD_DURATION.labels(model=model).observe(load_duration_seconds)
+        OLLAMA_LOAD_DURATION.labels(model=model, endpoint=endpoint).observe(load_duration_seconds)
         logger.debug(f"Model: {model}, Load Duration: {load_duration_seconds:.2f} seconds")
     if prompt_eval_duration > 0:
         prompt_eval_time_seconds = prompt_eval_duration / 1_000_000_000
-        OLLAMA_PROMPT_EVAL_DURATION.labels(model=model).observe(prompt_eval_time_seconds)
+        OLLAMA_PROMPT_EVAL_DURATION.labels(model=model, endpoint=endpoint).observe(prompt_eval_time_seconds)
         logger.debug(f"Model: {model}, Prompt Eval Duration: {prompt_eval_time_seconds:.2f} seconds")
     if prompt_eval_count > 0:
-        OLLAMA_PROMPT_EVAL_COUNT.labels(model=model).inc(prompt_eval_count)
+        OLLAMA_PROMPT_EVAL_COUNT.labels(model=model, endpoint=endpoint).inc(prompt_eval_count)
+        OLLAMA_PROMPT_TOKENS.labels(model=model, endpoint=endpoint).observe(prompt_eval_count)
         logger.debug(f"Model: {model}, Prompt Eval Count: {prompt_eval_count}")
     if eval_duration > 0:
         eval_duration_seconds = eval_duration / 1_000_000_000
-        OLLAMA_EVAL_DURATION.labels(model=model).observe(eval_duration_seconds)
+        OLLAMA_EVAL_DURATION.labels(model=model, endpoint=endpoint).observe(eval_duration_seconds)
         logger.debug(f"Model: {model}, Eval Duration: {eval_duration_seconds:.2f} seconds")
     if eval_count > 0:
-        OLLAMA_EVAL_COUNT.labels(model=model).inc(eval_count)
+        OLLAMA_EVAL_COUNT.labels(model=model, endpoint=endpoint).inc(eval_count)
+        OLLAMA_GENERATED_TOKENS.labels(model=model, endpoint=endpoint).observe(eval_count)
         logger.debug(f"Model: {model}, Eval Count: {eval_count}")
     if eval_duration > 0 and eval_count > 0:
         tps = eval_count / eval_duration * 1_000_000_000
-        OLLAMA_TOKENS_PER_SECOND.labels(model=model).observe(tps)
+        OLLAMA_TOKENS_PER_SECOND.labels(model=model, endpoint=endpoint).observe(tps)
         logger.debug(f"Model: {model}, Tokens per Second: {tps:.2f}")
+
+
+def record_request_outcome(model, endpoint, status):
+    """Count a finished request under its outcome.
+
+    The counter is incremented once, on completion, rather than on arrival:
+    the outcome is only known at the end, and requests still running are
+    already visible through ``ollama_requests_in_flight``.
+
+    Parameters
+    ----------
+    model : str
+        Model name to label the sample with.
+    endpoint : str
+        Normalised endpoint the request was served on.
+    status : str
+        One of the ``STATUS_*`` constants.
+    """
+    OLLAMA_CHAT_REQUEST_COUNT.labels(
+        model=model, endpoint=endpoint, status=status
+    ).inc()
+
+
+def find_final_chunk(raw_chunk):
+    """Return the terminal stats object contained in an ndjson chunk.
+
+    Ollama streams one JSON object per line and only the last one, flagged
+    ``"done": true``, carries the timing and token counts. A single network
+    read may hold several lines, or a fragment of one, so every line is tried
+    and undecodable ones are skipped rather than raised.
+
+    Parameters
+    ----------
+    raw_chunk : bytes
+        Bytes as read from the upstream stream.
+
+    Returns
+    -------
+    dict or None
+        The stats object when this chunk contained the final line, otherwise
+        ``None``.
+    """
+    try:
+        chunk_text = raw_chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        # A multi-byte character straddling two reads: the line it belongs to
+        # is not the terminal one anyway, so dropping this chunk is safe.
+        return None
+
+    final_chunk_data = None
+    for line in chunk_text.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            chunk_json = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if chunk_json.get("done", False):
+            final_chunk_data = chunk_json
+    return final_chunk_data
+
+
+async def stream_and_record(endpoint, model, headers, body, params, started):
+    """Proxy a streaming generation, yielding bytes as they arrive.
+
+    The generator owns the whole lifecycle of its request: it raises the
+    in-flight gauge on first iteration and, in a ``finally`` that also runs on
+    ``GeneratorExit``, lowers it again and counts the outcome. That is what
+    makes a client hanging up mid-stream show as ``status="aborted"`` instead
+    of silently vanishing.
+
+    Parameters
+    ----------
+    endpoint : str
+        Normalised endpoint, also used to build the upstream URL.
+    model : str
+        Model name requested by the client.
+    headers : dict of str to str
+        Headers to forward upstream, already stripped of the ones we rewrite.
+    body : dict
+        JSON request body to forward.
+    params : Mapping
+        Query parameters to forward.
+    started : float
+        ``time.perf_counter()`` reading taken when the request entered the
+        handler, used as the origin for time to first token.
+
+    Yields
+    ------
+    bytes
+        Upstream response chunks, forwarded untouched and in order.
+    """
+    in_flight = OLLAMA_REQUESTS_IN_FLIGHT.labels(model=model, endpoint=endpoint)
+    in_flight.inc()
+
+    status = STATUS_SUCCESS
+    first_chunk_seen = False
+    final_chunk_data = None
+
+    try:
+        async with make_http_client() as client:
+            async with client.stream(
+                "POST",
+                f"{OLLAMA_HOST}{endpoint}",
+                headers=headers,
+                json=body,
+                params=params,
+            ) as response:
+                # An error status still arrives as a stream; classify it here
+                # so the body (an error message rather than ndjson) is still
+                # forwarded to the client untouched.
+                status = classify_http_status(response.status_code)
+
+                async for chunk in response.aiter_bytes():
+                    if chunk and not first_chunk_seen:
+                        # Measured before the yield: what we want is how long
+                        # Ollama took, not how long the client took to read.
+                        OLLAMA_TIME_TO_FIRST_TOKEN.labels(
+                            model=model, endpoint=endpoint
+                        ).observe(time.perf_counter() - started)
+                        first_chunk_seen = True
+
+                    yield chunk
+
+                    if chunk:
+                        final_chunk_data = find_final_chunk(chunk) or final_chunk_data
+
+        if final_chunk_data:
+            extract_and_record_metrics(final_chunk_data, model, endpoint)
+    except (asyncio.CancelledError, GeneratorExit):
+        # Starlette cancels the task, then closes the generator, when the
+        # client goes away. Both must be re-raised: swallowing cancellation
+        # leaves the server task in an inconsistent state.
+        status = STATUS_ABORTED
+        logger.debug(f"Client aborted streaming request for model {model}")
+        raise
+    except httpx.HTTPError as exc:
+        status = STATUS_UPSTREAM_ERROR
+        logger.warning(f"Upstream error streaming from Ollama for model {model}: {exc}")
+        raise
+    finally:
+        in_flight.dec()
+        record_request_outcome(model, endpoint, status)
+
+
+async def proxy_and_record(endpoint, model, headers, body, params):
+    """Proxy a non-streaming generation and record its metrics.
+
+    Parameters
+    ----------
+    endpoint : str
+        Normalised endpoint, also used to build the upstream URL.
+    model : str
+        Model name requested by the client.
+    headers : dict of str to str
+        Headers to forward upstream.
+    body : dict
+        JSON request body to forward.
+    params : Mapping
+        Query parameters to forward.
+
+    Returns
+    -------
+    fastapi.Response
+        The upstream response, with hop-by-hop headers removed.
+
+    Raises
+    ------
+    httpx.HTTPError
+        Propagated after the failure has been counted as
+        ``status="upstream_error"``.
+    """
+    in_flight = OLLAMA_REQUESTS_IN_FLIGHT.labels(model=model, endpoint=endpoint)
+    in_flight.inc()
+
+    status = STATUS_SUCCESS
+    try:
+        async with make_http_client() as client:
+            response = await client.post(
+                f"{OLLAMA_HOST}{endpoint}",
+                headers=headers,
+                json=body,
+                params=params,
+            )
+
+        status = classify_http_status(response.status_code)
+
+        if response.status_code == 200:
+            try:
+                extract_and_record_metrics(response.json(), model, endpoint)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                # A 200 that is not JSON is odd but not fatal: forward it and
+                # let the client decide what to make of it.
+                pass
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=sanitize_response_headers(response.headers),
+        )
+    except asyncio.CancelledError:
+        status = STATUS_ABORTED
+        logger.debug(f"Client aborted request for model {model}")
+        raise
+    except httpx.HTTPError as exc:
+        status = STATUS_UPSTREAM_ERROR
+        logger.warning(f"Upstream error talking to Ollama for model {model}: {exc}")
+        raise
+    finally:
+        in_flight.dec()
+        record_request_outcome(model, endpoint, status)
+
 
 @app.get("/metrics")
 def metrics():
     """Expose Prometheus metrics."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
+
 @app.post("/api/chat")
 @app.post("/api/generate")
+@app.post("/api/embed")
 async def chat_with_metrics(request: Request):
-    """Handle chat and generate requests with streaming support and metrics extraction."""
+    """Handle generation requests with streaming support and metrics extraction.
+
+    Parameters
+    ----------
+    request : fastapi.Request
+        Incoming request on ``/api/chat``, ``/api/generate`` or ``/api/embed``.
+
+    Returns
+    -------
+    fastapi.Response or fastapi.responses.StreamingResponse
+        A streaming response when the client asked for one, the buffered
+        upstream response otherwise. ``/api/embed`` never streams.
+    """
+    # Taken first thing so time to first token covers everything the client
+    # waits through, body parsing and connection setup included.
+    started = time.perf_counter()
+
     body = await request.json()
     model = body.get("model", "unknown")
-    # logger.debug(f"Chat request body: {json.dumps(body, indent=4)}")
+    endpoint = normalise_endpoint(request.url.path)
     is_streaming = body.get("stream", False)
 
     headers = dict(request.headers)
     headers.pop("host", None)
+    # Dropped because httpx recomputes them for the re-serialised JSON body.
     headers.pop("content-length", None)
     headers.pop("content-type", None)
 
-    OLLAMA_CHAT_REQUEST_COUNT.labels(model=model).inc()
-
     if is_streaming:
-        async def generate_stream():
-            endpoint = request.url.path  # /api/chat or /api/generate
-            async with httpx.AsyncClient(timeout=httpx.Timeout(900.0, read=900.0)) as client:
-                async with client.stream("POST", f"{OLLAMA_HOST}{endpoint}", headers=headers, json=body, params=request.query_params) as response:
+        return StreamingResponse(
+            stream_and_record(
+                endpoint, model, headers, body, request.query_params, started
+            ),
+            media_type="application/json",
+        )
 
-                    final_chunk_data = None
+    return await proxy_and_record(endpoint, model, headers, body, request.query_params)
 
-                    async for chunk in response.aiter_bytes():
-                        # Forward the chunk immediately to the client
-                        yield chunk
-
-                        # Try to parse the chunk to look for metrics
-                        if chunk:
-                            try:
-                                chunk_text = chunk.decode('utf-8')
-                                lines = chunk_text.strip().split('\n')
-
-                                for line in lines:
-                                    if line.strip():
-                                        try:
-                                            chunk_json = json.loads(line)
-                                            # Check if this is the final chunk (contains "done": true)
-                                            if chunk_json.get("done", False):
-                                                final_chunk_data = chunk_json
-                                        except json.JSONDecodeError:
-                                            continue
-
-                            except UnicodeDecodeError:
-                                pass
-
-                    # Extract metrics from the final chunk if available
-                    if final_chunk_data:
-                        extract_and_record_metrics(final_chunk_data, model)
-
-        return StreamingResponse(generate_stream(), media_type="application/json")
-    else:
-        endpoint = request.url.path  # /api/chat or /api/generate
-        async with httpx.AsyncClient(timeout=httpx.Timeout(900.0, read=900.0)) as client:
-            response = await client.post(f"{OLLAMA_HOST}{endpoint}", headers=headers, json=body, params=request.query_params)
-
-            if response.status_code == 200:
-                try:
-                    response_data = response.json()
-                    extract_and_record_metrics(response_data, model)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-            return Response(content=response.content, status_code=response.status_code, headers=sanitize_response_headers(response.headers))
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def simple_proxy(request: Request, path: str):
@@ -229,11 +608,12 @@ async def simple_proxy(request: Request, path: str):
     headers.pop("host", None)
     headers.pop("content-length", None)
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(900.0, read=900.0)) as client:
+    async with make_http_client() as client:
         response = await client.request(method=request.method, url=f"{OLLAMA_HOST}/{path}", headers=headers, content=await request.body(), params=request.query_params)
 
     logger.debug(f"Proxy response: {response.status_code} for {request.method} /{path}")
     return Response(content=response.content, status_code=response.status_code, headers=sanitize_response_headers(response.headers))
+
 
 async def verify_ollama_connection():
     """Verify connection to Ollama server at startup."""
