@@ -6,6 +6,7 @@ same global registry) cannot be mistaken for this test's own state.
 """
 
 import asyncio
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -188,3 +189,51 @@ def test_refresh_model_residency_marks_upstream_down_without_raising(monkeypatch
     asyncio.run(oe.refresh_model_residency())  # must not raise
 
     assert metric_value("ollama_upstream_up") == 0
+
+
+def test_repulled_model_replaces_its_info_series():
+    """Changed model details drop the previous ollama_model_info child.
+
+    Re-pulling a tag can swap the quantization under an unchanged model name.
+    The info series is a join target, so two children for one model would make
+    any dashboard join return duplicate rows.
+    """
+    model = "residency-repull"
+    first = _ps_entry(model)
+    second = _ps_entry(model, details=dict(first["details"], quantization_level="Q8_0"))
+
+    def info_labels(quantization):
+        return {
+            "model": model,
+            "family": "llama",
+            "parameter_size": "8B",
+            "quantization_level": quantization,
+        }
+
+    oe.update_residency_metrics([first])
+    oe.update_residency_metrics([second])
+
+    assert REGISTRY.get_sample_value("ollama_model_info", info_labels("Q4_0")) is None
+    assert REGISTRY.get_sample_value("ollama_model_info", info_labels("Q8_0")) == 1
+
+
+def test_expires_seconds_counts_down_from_the_injected_reference():
+    """The keep_alive countdown is expires_at minus the reference instant.
+
+    ``now`` is injected rather than read from the clock so the assertion is an
+    exact number of seconds instead of a tolerance around wall time.
+    """
+    model = "residency-countdown"
+    entry = _ps_entry(model, expires_at="2026-09-13T12:05:00Z")
+    reference = datetime(2026, 9, 13, 12, 0, 0, tzinfo=timezone.utc)
+
+    oe.update_residency_metrics([entry], now=reference)
+
+    assert REGISTRY.get_sample_value("ollama_model_expires_seconds", {"model": model}) == 300
+
+    # Past its expiry the countdown goes negative rather than vanishing, which
+    # is what makes an overdue eviction visible on a graph.
+    oe.update_residency_metrics(
+        [entry], now=datetime(2026, 9, 13, 12, 6, 0, tzinfo=timezone.utc)
+    )
+    assert REGISTRY.get_sample_value("ollama_model_expires_seconds", {"model": model}) == -60

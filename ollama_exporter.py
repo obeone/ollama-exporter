@@ -855,6 +855,14 @@ def update_residency_metrics(models, now=None):
             details.get("quantization_level", "unknown"),
         )
 
+        previous_info = _RESIDENT_MODELS.get(name)
+        if previous_info is not None and previous_info != info_labels:
+            # Same name, different details. Re-pulling a tag can change the
+            # quantization or the parameter size under an unchanged name, and
+            # the ollama_model_info child published with the old label values
+            # would otherwise linger next to the new one forever.
+            _remove_child(OLLAMA_MODEL_INFO, name, *previous_info)
+
         OLLAMA_MODEL_LOADED.labels(model=name).set(1)
         OLLAMA_MODEL_VRAM_BYTES.labels(model=name).set(entry.get("size_vram", 0))
         OLLAMA_MODEL_SIZE_BYTES.labels(model=name).set(entry.get("size", 0))
