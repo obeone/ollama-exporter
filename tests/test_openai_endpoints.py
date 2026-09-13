@@ -12,6 +12,7 @@ import asyncio
 import time
 
 import httpx
+from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
 
 import ollama_exporter as oe
@@ -168,6 +169,41 @@ def test_upstream_5xx_counts_as_server_error(monkeypatch):
 
     assert response.status_code == 500
     assert metric_value("ollama_requests_total", labels) - before == 1
+
+
+def test_the_app_routes_v1_through_the_instrumented_handler(monkeypatch):
+    """A real request to /v1/chat/completions is labelled, not swallowed.
+
+    The catch-all proxy matches every path, so a missing or late-registered
+    route would leave the recorder tests passing while the running exporter
+    stayed blind. This goes through the ASGI app to pin the routing itself.
+    The client is built without a ``with`` block on purpose, so the lifespan
+    and its residency poller never start.
+    """
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-2",
+                "choices": [{"message": {"content": "hi"}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            },
+        )
+
+    _patch_client(monkeypatch, handler)
+
+    labels = {"model": "routed-model", "endpoint": CHAT_ENDPOINT, "status": "success"}
+    other = {"model": "routed-model", "endpoint": "other", "status": "success"}
+    before = metric_value("ollama_requests_total", labels)
+
+    response = TestClient(oe.app).post(
+        CHAT_ENDPOINT, json={"model": "routed-model", "messages": []}
+    )
+
+    assert response.status_code == 200
+    assert metric_value("ollama_requests_total", labels) - before == 1
+    assert metric_value("ollama_requests_total", other) == 0
 
 
 # ---------------------------------------------------------------------------
