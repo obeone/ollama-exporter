@@ -4,6 +4,7 @@ This is a **Prometheus Exporter** for **Ollama**, designed to monitor request st
 
 ## Features
 - **Tracks requests per model and endpoint**, broken down by outcome (`ollama_requests_total`)
+- **Covers both API schemas**: Ollama's native endpoints and its OpenAI-compatible ones (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`), which is where most clients actually land
 - **Measures response time**, including time to first token for streaming replies
 - **Reports requests currently in flight** (`ollama_requests_in_flight`)
 - **Records model load times** (`ollama_load_duration_seconds`)
@@ -74,7 +75,7 @@ docker restart <prometheus-container-name>
 
 ## Metrics
 
-Every request-scoped metric carries an `endpoint` label: `/api/chat`, `/api/generate`, `/api/embed`, or `other` for anything else. `other` is a bounded fallback, not a per-path breakdown; unrecognised paths never leak into the label value.
+Every request-scoped metric carries an `endpoint` label: `/api/chat`, `/api/generate`, `/api/embed`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, or `other` for anything else. `other` is a bounded fallback, not a per-path breakdown; unrecognised paths never leak into the label value.
 
 ### Request metrics
 
@@ -92,6 +93,7 @@ Every request-scoped metric carries an `endpoint` label: `/api/chat`, `/api/gene
 | `ollama_prompt_tokens` | Histogram | `model`, `endpoint` | Distribution of prompt sizes in tokens |
 | `ollama_generated_tokens` | Histogram | `model`, `endpoint` | Distribution of response sizes in tokens |
 | `ollama_tokens_per_second` | Histogram | `model`, `endpoint` | Tokens generated per second |
+| `ollama_usage_missing_total` | Counter | `model`, `endpoint` | Streaming OpenAI-compatible replies that ended without a `usage` block |
 
 `ollama_requests_total` is incremented once the request finishes, with `status` set to one of:
 
@@ -102,6 +104,14 @@ Every request-scoped metric carries an `endpoint` label: `/api/chat`, `/api/gene
 | `server_error` | Upstream answered with a 5xx status |
 | `aborted` | The client disconnected mid-stream |
 | `upstream_error` | The exporter could not reach Ollama |
+
+### What the OpenAI-compatible endpoints can and cannot report
+
+The native endpoints answer with Ollama's own schema, which carries nanosecond timings for the model load, the prompt evaluation and the generation. The `/v1/*` endpoints answer with the OpenAI schema, which carries none of them: only a `usage` object with `prompt_tokens` and `completion_tokens`.
+
+So on `/v1/*` the exporter records the request counter, the status, the in-flight gauge, the response time and the time to first token (all measured by the exporter itself), plus the token counts and a tokens-per-second figure derived from them. `ollama_load_duration_seconds`, `ollama_prompt_eval_duration_seconds` and `ollama_eval_duration_seconds` take **no observation at all** on this path. Feeding them a zero would be easy and wrong: it would pull every quantile and every `rate(_sum)/rate(_count)` average towards zero, including the ones the native endpoints populate correctly. A missing observation says "not measured here", which is the truth.
+
+One more gap worth knowing about. On a streaming `/v1/*` request, Ollama only sends the `usage` object when the client sets `stream_options: {"include_usage": true}`. Most do not, and their tokens are then counted nowhere. The exporter does not rewrite the request to force the option, since that would change the event stream the client receives; it increments `ollama_usage_missing_total` instead, so the undercount is visible rather than silent. Comparing `rate(ollama_usage_missing_total[5m])` against `rate(ollama_requests_total[5m])` on the same endpoint tells you how much of your token accounting is guesswork.
 
 ### Model residency metrics
 
