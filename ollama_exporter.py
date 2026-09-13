@@ -2,7 +2,9 @@
 
 The exporter sits in front of an Ollama server: every request is forwarded
 verbatim, while the generation endpoints (``/api/chat``, ``/api/generate``,
-``/api/embed``) additionally have their stats object mined for metrics.
+``/api/embed``) additionally have their stats object mined for metrics. A
+background task polls ``/api/ps`` so the resident-model set, its VRAM
+footprint and its ``keep_alive`` countdown are observable too.
 """
 
 import os
@@ -11,8 +13,12 @@ import asyncio
 import httpx
 import json
 import logging
+import re
 import socket
 import time
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
@@ -25,12 +31,17 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST,
 )
 
+# Reported through ollama_exporter_build_info so a dashboard can tell which
+# build answered the scrape. CI may stamp a git describe / tag through the env.
+__version__ = os.getenv("EXPORTER_VERSION", "2.0.0")
+
 # Default values, overridable via environment variables or CLI arguments.
 # CLI arguments take precedence over environment variables (see parse_args).
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_LISTEN_HOST = "::"  # dual-stack: binds both IPv6 and IPv4
 DEFAULT_LISTEN_PORT = 8000
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_PS_INTERVAL_SECONDS = 15.0
 
 # Fallback when the host has no usable IPv6 stack (see bind_listen_socket).
 IPV4_WILDCARD = "0.0.0.0"
@@ -40,12 +51,21 @@ IPV4_WILDCARD = "0.0.0.0"
 IPV6_WILDCARDS = frozenset({"::", "[::]", "::0"})
 
 # Generation can legitimately run for many minutes on a large model, so the
-# proxy timeout is deliberately generous.
+# proxy timeout is deliberately generous. The residency poll is a cheap local
+# status call and gets a short one instead, so a wedged upstream shows up as
+# ollama_upstream_up=0 within one scrape interval rather than hanging the task.
 PROXY_TIMEOUT = httpx.Timeout(900.0, read=900.0)
+PS_TIMEOUT = httpx.Timeout(5.0)
 
 # Configurable Ollama host. Populated by parse_args(); the env default keeps
 # backward compatibility for code paths that import this module directly.
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
+
+# Seconds between two /api/ps polls. Zero or negative disables the poller,
+# which is what tests and pure-proxy deployments want.
+PS_INTERVAL_SECONDS = float(
+    os.getenv("OLLAMA_PS_INTERVAL_SECONDS", DEFAULT_PS_INTERVAL_SECONDS)
+)
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
@@ -67,7 +87,40 @@ STATUS_ABORTED = "aborted"
 STATUS_UPSTREAM_ERROR = "upstream_error"
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app):
+    """Run the residency poller for the lifetime of the application.
+
+    Parameters
+    ----------
+    app : fastapi.FastAPI
+        The application being started. Unused, but required by the Starlette
+        lifespan protocol.
+
+    Yields
+    ------
+    None
+        Control is handed back to the server while the poller runs in the
+        background.
+    """
+    task = None
+    if PS_INTERVAL_SECONDS > 0:
+        task = asyncio.create_task(poll_model_residency(PS_INTERVAL_SECONDS))
+    else:
+        logger.info("Residency poller disabled (OLLAMA_PS_INTERVAL_SECONDS <= 0)")
+
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            # Awaiting the cancelled task keeps shutdown quiet: without it
+            # asyncio logs "Task was destroyed but it is pending".
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+app = FastAPI(lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # Bucket layouts
@@ -182,6 +235,65 @@ OLLAMA_TOKENS_PER_SECOND = Histogram(
     ["model", "endpoint"],
     buckets=TOKENS_PER_SECOND_BUCKETS,
 )
+
+# ---------------------------------------------------------------------------
+# Residency metrics, fed by the /api/ps poller
+# ---------------------------------------------------------------------------
+
+OLLAMA_MODEL_LOADED = Gauge(
+    "ollama_model_loaded",
+    "1 while the model occupies VRAM; the series disappears once it is evicted",
+    ["model"],
+)
+OLLAMA_MODEL_VRAM_BYTES = Gauge(
+    "ollama_model_vram_bytes",
+    "Bytes of VRAM the resident model occupies",
+    ["model"],
+)
+OLLAMA_MODEL_SIZE_BYTES = Gauge(
+    "ollama_model_size_bytes",
+    "Total size in bytes of the resident model, VRAM and host memory combined",
+    ["model"],
+)
+OLLAMA_MODEL_CONTEXT_LENGTH = Gauge(
+    "ollama_model_context_length",
+    "Context window the resident model was loaded with, in tokens",
+    ["model"],
+)
+OLLAMA_MODEL_EXPIRES_SECONDS = Gauge(
+    "ollama_model_expires_seconds",
+    "Seconds left on the keep_alive countdown before the model is evicted",
+    ["model"],
+)
+OLLAMA_MODELS_LOADED = Gauge(
+    "ollama_models_loaded",
+    "Number of models currently resident",
+)
+OLLAMA_MODEL_SWAPS = Counter(
+    "ollama_model_swaps_total",
+    "Times a model entered the resident set, i.e. was loaded from cold",
+    ["model"],
+)
+OLLAMA_MODEL_INFO = Gauge(
+    "ollama_model_info",
+    "Static description of a resident model; always 1, meant as a join target",
+    ["model", "family", "parameter_size", "quantization_level"],
+)
+OLLAMA_UPSTREAM_UP = Gauge(
+    "ollama_upstream_up",
+    "1 when the last /api/ps poll reached the Ollama server",
+)
+OLLAMA_BUILD_INFO = Gauge(
+    "ollama_exporter_build_info",
+    "Always 1; the version label carries the running exporter build",
+    ["version"],
+)
+OLLAMA_BUILD_INFO.labels(version=__version__).set(1)
+
+# Resident models observed during the previous poll, mapped to the label values
+# their ollama_model_info series was published with. The label values are kept
+# because removing a child series requires replaying them exactly.
+_RESIDENT_MODELS = {}
 
 
 # Headers that describe the upstream connection/framing and must never be
@@ -615,6 +727,195 @@ async def simple_proxy(request: Request, path: str):
     return Response(content=response.content, status_code=response.status_code, headers=sanitize_response_headers(response.headers))
 
 
+# ---------------------------------------------------------------------------
+# Residency poller
+# ---------------------------------------------------------------------------
+
+# Go's time formatting emits up to nanosecond precision, while
+# datetime.fromisoformat tops out at microseconds. Trim the surplus digits
+# instead of failing the whole parse over sub-microsecond noise.
+_SURPLUS_FRACTIONAL_DIGITS = re.compile(r"(\.\d{6})\d+")
+
+
+def parse_expires_at(raw):
+    """Parse the ``expires_at`` timestamp returned by ``/api/ps``.
+
+    Parameters
+    ----------
+    raw : str or None
+        RFC 3339 timestamp as emitted by Ollama, e.g.
+        ``"2026-09-13T14:38:31.83753294-07:00"``.
+
+    Returns
+    -------
+    datetime.datetime or None
+        A timezone-aware datetime, or ``None`` when the field is missing or
+        unparseable.
+    """
+    if not raw:
+        return None
+
+    text = _SURPLUS_FRACTIONAL_DIGITS.sub(r"\1", str(raw).strip())
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        logger.debug(f"Unparseable expires_at from /api/ps: {raw!r}")
+        return None
+
+    # Ollama always sends an offset, but a naive value would otherwise blow up
+    # the subtraction against an aware "now".
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _remove_child(metric, *label_values):
+    """Drop one labelled child series, tolerating an already-absent child.
+
+    Parameters
+    ----------
+    metric : prometheus_client.metrics.MetricWrapperBase
+        The labelled metric family to prune.
+    *label_values : str
+        Label values identifying the child, in declaration order.
+    """
+    try:
+        metric.remove(*label_values)
+    except KeyError:
+        pass
+
+
+def clear_model_residency(model, info_labels):
+    """Remove every residency series belonging to an evicted model.
+
+    Gauges are removed rather than zeroed: a stale ``ollama_model_loaded=1``
+    for a model that left VRAM half an hour ago is worse than no sample at
+    all, and an absent series makes ``keep_alive`` eviction visible as a gap.
+
+    Parameters
+    ----------
+    model : str
+        Name of the model that left the resident set.
+    info_labels : tuple of str
+        The ``(family, parameter_size, quantization_level)`` values its
+        ``ollama_model_info`` series was published with.
+    """
+    _remove_child(OLLAMA_MODEL_LOADED, model)
+    _remove_child(OLLAMA_MODEL_VRAM_BYTES, model)
+    _remove_child(OLLAMA_MODEL_SIZE_BYTES, model)
+    _remove_child(OLLAMA_MODEL_CONTEXT_LENGTH, model)
+    _remove_child(OLLAMA_MODEL_EXPIRES_SECONDS, model)
+    _remove_child(OLLAMA_MODEL_INFO, model, *info_labels)
+
+
+def update_residency_metrics(models, now=None):
+    """Reconcile the residency gauges with one ``/api/ps`` payload.
+
+    Parameters
+    ----------
+    models : list of dict
+        The ``models`` array from ``/api/ps``.
+    now : datetime.datetime, optional
+        Reference instant for the ``expires_at`` countdown. Defaults to the
+        current UTC time; injectable so tests are not time-dependent.
+
+    Notes
+    -----
+    The first poll after an exporter restart counts every resident model as a
+    swap, since nothing was known about the previous state. That is a
+    restart artifact, not a thrash signal, and is why dashboards should read
+    ``ollama_model_swaps_total`` as a rate rather than an absolute.
+    """
+    global _RESIDENT_MODELS
+
+    reference = now or datetime.now(timezone.utc)
+
+    current = {}
+    for entry in models or []:
+        if not isinstance(entry, dict):
+            continue
+        # /api/ps calls the field "name"; some versions also carry "model".
+        name = entry.get("name") or entry.get("model")
+        if name:
+            current[name] = entry
+
+    for name, info_labels in _RESIDENT_MODELS.items():
+        if name not in current:
+            clear_model_residency(name, info_labels)
+
+    resident = {}
+    for name, entry in current.items():
+        if name not in _RESIDENT_MODELS:
+            OLLAMA_MODEL_SWAPS.labels(model=name).inc()
+
+        details = entry.get("details") or {}
+        info_labels = (
+            details.get("family", "unknown"),
+            details.get("parameter_size", "unknown"),
+            details.get("quantization_level", "unknown"),
+        )
+
+        OLLAMA_MODEL_LOADED.labels(model=name).set(1)
+        OLLAMA_MODEL_VRAM_BYTES.labels(model=name).set(entry.get("size_vram", 0))
+        OLLAMA_MODEL_SIZE_BYTES.labels(model=name).set(entry.get("size", 0))
+        if entry.get("context_length"):
+            OLLAMA_MODEL_CONTEXT_LENGTH.labels(model=name).set(entry["context_length"])
+
+        expires_at = parse_expires_at(entry.get("expires_at"))
+        if expires_at is not None:
+            OLLAMA_MODEL_EXPIRES_SECONDS.labels(model=name).set(
+                (expires_at - reference).total_seconds()
+            )
+
+        OLLAMA_MODEL_INFO.labels(model=name, family=info_labels[0],
+                                 parameter_size=info_labels[1],
+                                 quantization_level=info_labels[2]).set(1)
+
+        resident[name] = info_labels
+
+    OLLAMA_MODELS_LOADED.set(len(resident))
+    _RESIDENT_MODELS = resident
+
+
+async def refresh_model_residency():
+    """Poll ``/api/ps`` once and reconcile the residency gauges.
+
+    Any failure, network or payload, is contained here: it flips
+    ``ollama_upstream_up`` to 0 and returns, leaving the residency gauges at
+    their last known values rather than clearing them on a transient blip.
+    """
+    try:
+        async with make_http_client(PS_TIMEOUT) as client:
+            response = await client.get(f"{OLLAMA_HOST}/api/ps")
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        # Deliberately broad: httpx errors, JSON decoding and any surprise the
+        # upstream throws must all degrade to "upstream down", never kill the
+        # poller. CancelledError is a BaseException and still propagates, so
+        # shutdown keeps working.
+        OLLAMA_UPSTREAM_UP.set(0)
+        logger.warning(f"Residency poll of {OLLAMA_HOST}/api/ps failed: {exc}")
+        return
+
+    OLLAMA_UPSTREAM_UP.set(1)
+    update_residency_metrics(payload.get("models") if isinstance(payload, dict) else [])
+
+
+async def poll_model_residency(interval):
+    """Refresh the residency gauges forever, one poll every ``interval``.
+
+    Parameters
+    ----------
+    interval : float
+        Seconds to wait between two polls.
+    """
+    logger.info(f"Polling {OLLAMA_HOST}/api/ps every {interval}s for model residency")
+    while True:
+        await refresh_model_residency()
+        await asyncio.sleep(interval)
+
+
 async def verify_ollama_connection():
     """Verify connection to Ollama server at startup."""
     logger.debug(f"Verifying connection to Ollama server at {OLLAMA_HOST}")
@@ -645,8 +946,8 @@ def parse_args(argv=None):
     Returns
     -------
     argparse.Namespace
-        Parsed arguments with ``host``, ``port``, ``ollama_host`` and
-        ``log_level`` attributes.
+        Parsed arguments with ``host``, ``port``, ``ollama_host``,
+        ``ps_interval`` and ``log_level`` attributes.
     """
     parser = argparse.ArgumentParser(
         description="Prometheus exporter and metrics-extracting proxy for Ollama."
@@ -667,6 +968,13 @@ def parse_args(argv=None):
         "--ollama-host",
         default=os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST),
         help="Base URL of the upstream Ollama server (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--ps-interval",
+        type=float,
+        default=float(os.getenv("OLLAMA_PS_INTERVAL_SECONDS", DEFAULT_PS_INTERVAL_SECONDS)),
+        help="Seconds between two /api/ps residency polls; 0 disables the "
+             "poller (default: %(default)s).",
     )
     parser.add_argument(
         "--log-level",
@@ -730,11 +1038,14 @@ def bind_listen_socket(host, port):
 
 async def main():
     """Configure runtime from CLI/env, then start the exporter server."""
-    global OLLAMA_HOST
+    global OLLAMA_HOST, PS_INTERVAL_SECONDS
     args = parse_args()
 
     # CLI/env arguments override the module-level defaults set at import time.
+    # The residency poller reads these globals when the lifespan starts, which
+    # happens after this point, so assigning them here is enough.
     OLLAMA_HOST = args.ollama_host
+    PS_INTERVAL_SECONDS = args.ps_interval
     logger.setLevel(getattr(logging, args.log_level, logging.INFO))
 
     await verify_ollama_connection()
