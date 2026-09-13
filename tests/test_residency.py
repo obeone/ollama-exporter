@@ -6,10 +6,12 @@ same global registry) cannot be mistaken for this test's own state.
 """
 
 import asyncio
+import time
 from datetime import datetime, timezone
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
 
 import ollama_exporter as oe
@@ -237,3 +239,35 @@ def test_expires_seconds_counts_down_from_the_injected_reference():
         [entry], now=datetime(2026, 9, 13, 12, 6, 0, tzinfo=timezone.utc)
     )
     assert REGISTRY.get_sample_value("ollama_model_expires_seconds", {"model": model}) == -60
+
+
+def test_the_lifespan_starts_a_poller_that_populates_gauges(monkeypatch):
+    """Booting the app runs the residency poller as a background task.
+
+    This is the only test that goes through the real ASGI lifespan, because
+    the wiring between ``lifespan`` and ``poll_model_residency`` is exactly
+    what unit tests on ``refresh_model_residency`` cannot reach. The interval
+    is shortened so the first poll lands well inside the wait below.
+    """
+    model = "residency-lifespan"
+
+    def handler(request):
+        assert request.url.path == "/api/ps"
+        return httpx.Response(200, json={"models": [_ps_entry(model)]})
+
+    _patch_client(monkeypatch, handler)
+    monkeypatch.setattr(oe, "PS_INTERVAL_SECONDS", 0.01)
+
+    # Entering the context manager is what runs the lifespan; TestClient
+    # drives the app on its own thread, so the poll happens while we wait.
+    with TestClient(oe.app) as client:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if REGISTRY.get_sample_value("ollama_model_loaded", {"model": model}) == 1:
+                break
+            time.sleep(0.01)
+
+        assert metric_value("ollama_upstream_up") == 1
+        assert REGISTRY.get_sample_value("ollama_model_loaded", {"model": model}) == 1
+        # The app still serves while the poller runs.
+        assert client.get("/metrics").status_code == 200
