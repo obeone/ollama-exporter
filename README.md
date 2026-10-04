@@ -17,7 +17,7 @@ This is a **Prometheus Exporter** for **Ollama**, designed to monitor request st
 
 #### 1. Install Dependencies
 ```sh
-pip install fastapi uvicorn prometheus_client httpx
+pip install fastapi uvicorn prometheus_client httpx anyio
 ```
 
 #### 2. Run the Exporter
