@@ -63,17 +63,16 @@ class _FakeUpstream:
     def __init__(self, *args, **kwargs):
         """Accept and ignore the real client's constructor arguments."""
 
-    async def __aenter__(self):
-        """Enter the async context, mirroring httpx.AsyncClient."""
-        return self
+    def build_request(self, method, url, **kwargs):
+        """Build a plain request, mirroring httpx.AsyncClient."""
+        return httpx.Request(method, url)
 
-    async def __aexit__(self, *exc):
-        """Leave the async context without suppressing exceptions."""
-        return False
-
-    async def post(self, *args, **kwargs):
+    async def send(self, request, stream=False):
         """Return a minimal successful non-streaming chat response."""
         return httpx.Response(200, json={"message": {"content": "hi"}, "done": True})
+
+    async def aclose(self):
+        """Nothing to release."""
 
 
 def _send_chat(monkeypatch, trusted_hosts, forwarded_for=None, peer=PEER, path="/api/chat"):
