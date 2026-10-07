@@ -18,6 +18,13 @@ DEFAULT_LISTEN_HOST = "::"  # dual-stack: binds both IPv6 and IPv4
 DEFAULT_LISTEN_PORT = 8000
 DEFAULT_LOG_LEVEL = "INFO"
 
+# Only the loopback is trusted to set X-Forwarded-For by default, so a client
+# reaching the exporter directly cannot spoof its address.
+DEFAULT_FORWARDED_ALLOW_IPS = "127.0.0.1"
+
+# Values accepted as "true" for boolean environment variables.
+TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
+
 # Fallback when the host has no usable IPv6 stack (see bind_listen_socket).
 IPV4_WILDCARD = "0.0.0.0"
 
@@ -29,6 +36,10 @@ IPV6_WILDCARDS = frozenset({"::", "[::]", "::0"})
 # backward compatibility for code paths that import this module directly.
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
 
+# Whether to count requests per source client. Populated by parse_args(); off
+# by default because a client address label has unbounded cardinality.
+TRACK_CLIENTS = False
+
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 LOG_LEVEL = os.getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
@@ -37,6 +48,13 @@ logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 app = FastAPI()
 
 OLLAMA_CHAT_REQUEST_COUNT = Counter("ollama_requests_total", "Total chat requests", ["model"])
+# Optional: only incremented when --track-clients is set. A labelled counter
+# emits no samples until used, so defining it here costs nothing when disabled.
+OLLAMA_CLIENT_REQUEST_COUNT = Counter(
+    "ollama_client_requests_total",
+    "Chat and generate requests per source client",
+    ["model", "client"],
+)
 
 OLLAMA_TOTAL_DURATION =       Histogram("ollama_response_seconds", "Total time spent for the response", ["model"])
 OLLAMA_LOAD_DURATION =        Histogram("ollama_load_duration_seconds", "Time spent loading the model", ["model"])
@@ -154,6 +172,13 @@ async def chat_with_metrics(request: Request):
 
     OLLAMA_CHAT_REQUEST_COUNT.labels(model=model).inc()
 
+    if TRACK_CLIENTS:
+        # uvicorn's proxy-headers middleware has already replaced
+        # request.client with the X-Forwarded-For address when the direct peer
+        # is trusted, so no header parsing is needed (or wanted) here.
+        client_host = request.client.host if request.client else "unknown"
+        OLLAMA_CLIENT_REQUEST_COUNT.labels(model=model, client=client_host).inc()
+
     if is_streaming:
         async def generate_stream():
             endpoint = request.url.path  # /api/chat or /api/generate
@@ -248,8 +273,9 @@ def parse_args(argv=None):
     Returns
     -------
     argparse.Namespace
-        Parsed arguments with ``host``, ``port``, ``ollama_host`` and
-        ``log_level`` attributes.
+        Parsed arguments with ``host``, ``port``, ``ollama_host``,
+        ``log_level``, ``track_clients`` (bool) and ``forwarded_allow_ips``
+        (str) attributes.
     """
     parser = argparse.ArgumentParser(
         description="Prometheus exporter and metrics-extracting proxy for Ollama."
@@ -277,6 +303,21 @@ def parse_args(argv=None):
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         type=str.upper,
         help="Logging verbosity (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--track-clients",
+        action="store_true",
+        default=os.getenv("EXPORTER_TRACK_CLIENTS", "").strip().lower() in TRUTHY_VALUES,
+        help="Count chat/generate requests per source client "
+             "(ollama_client_requests_total). Off by default: the client label "
+             "has unbounded cardinality.",
+    )
+    parser.add_argument(
+        "--forwarded-allow-ips",
+        default=os.getenv("FORWARDED_ALLOW_IPS", DEFAULT_FORWARDED_ALLOW_IPS),
+        help="Comma-separated IPs/CIDRs, or '*', allowed to set X-Forwarded-For. "
+             "The header is only trusted when the direct peer is in this list; "
+             "from anyone else it is ignored (default: %(default)s).",
     )
     return parser.parse_args(argv)
 
@@ -333,16 +374,23 @@ def bind_listen_socket(host, port):
 
 async def main():
     """Configure runtime from CLI/env, then start the exporter server."""
-    global OLLAMA_HOST
+    global OLLAMA_HOST, TRACK_CLIENTS
     args = parse_args()
 
     # CLI/env arguments override the module-level defaults set at import time.
     OLLAMA_HOST = args.ollama_host
+    TRACK_CLIENTS = args.track_clients
     logger.setLevel(getattr(logging, args.log_level, logging.INFO))
 
     await verify_ollama_connection()
     config = uvicorn.Config(
-        app, host=args.host, port=args.port, log_level=args.log_level.lower()
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level.lower(),
+        # uvicorn rewrites request.client from X-Forwarded-For only when the
+        # direct peer matches this list.
+        forwarded_allow_ips=args.forwarded_allow_ips,
     )
     server = uvicorn.Server(config)
 
