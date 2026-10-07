@@ -97,7 +97,7 @@ docker restart <prometheus-container-name>
 | Metric Name | Description |
 |------------|-------------|
 | `ollama_requests_total` | Total chat and generate requests (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`) |
-| `ollama_client_requests_total` | Chat and generate requests per source client (optional, see [Per-client metrics](#per-client-metrics)) |
+| `ollama_client_requests_total` | Chat and generate requests per source client (optional, labels `model`, `client`, `hostname`, see [Per-client metrics](#per-client-metrics)) |
 | `ollama_inflight_requests` | Inference requests currently being proxied to Ollama, per model |
 | `ollama_response_seconds` | Total time spent for the response |
 | `ollama_load_duration_seconds` | Time spent loading the model |
@@ -115,7 +115,7 @@ client sets `stream_options.include_usage`.
 
 ## Per-client metrics
 
-`ollama_client_requests_total{model, client}` counts chat and generate requests
+`ollama_client_requests_total{model, client, hostname}` counts chat and generate requests
 per source client. It is disabled by default because a client address label has
 unbounded cardinality and can bloat Prometheus on a busy or exposed instance.
 Enable it only on networks where the set of clients is small and known.
@@ -123,6 +123,8 @@ Enable it only on networks where the set of clients is small and known.
 | Flag | Environment variable | Description |
 |------|----------------------|-------------|
 | `--track-clients` | `EXPORTER_TRACK_CLIENTS` | Enable the counter (`1`, `true`, `yes` or `on`) |
+| `--resolve-clients` | `EXPORTER_RESOLVE_CLIENTS` | Fill `hostname` with the client's reverse DNS name (same truthy values); needs `--track-clients` |
+| `--client-hostname-ignore` | `EXPORTER_CLIENT_HOSTNAME_IGNORE` | Case-insensitive regex; resolved names matching it fall back to the IP |
 | `--forwarded-allow-ips` | `FORWARDED_ALLOW_IPS` | Comma-separated IPs/CIDRs, or `*`, allowed to set `X-Forwarded-For` (default `127.0.0.1,::1`) |
 
 Behind a reverse proxy, the client is read from `X-Forwarded-For`, but only when
@@ -136,6 +138,45 @@ through them.
 docker run -d --name ollama-exporter -p 8000:8000 ollama-exporter \
   --ollama-host http://192.168.1.100:11434 \
   --track-clients --forwarded-allow-ips 10.0.0.0/8
+```
+
+### Client hostnames
+
+With `--resolve-clients`, the `hostname` label holds the reverse DNS (PTR) name
+of `client`, lowercased and without the trailing dot. Lookups run in a small
+background thread pool and are bounded: 1 second timeout, a cache of 4096
+addresses (least recently used evicted first), 1 hour for a found name and
+5 minutes for a failure. A timeout or a temporary resolver error keeps the
+previously known name, so a DNS blip does not flip an established series back
+to the IP.
+
+`--client-hostname-ignore` takes a regex, applied with `re.search` and without
+case sensitivity to the resolved name. A match falls back to the IP, which is
+handy for auto-generated names that say nothing, for example
+`--client-hostname-ignore '\.ipv6\.obeone\.org$'`.
+
+Requests never wait for a lookup. The first requests of an unknown client are
+normally not counted under the IP: the proxied request goes through
+immediately, and the counter increment is deferred until the lookup ends (1
+second at most), landing directly under the final hostname. Every request
+increments exactly one series. A series changes hostname if the PTR record
+itself changes, or if a client that had no name gains one after the 5 minute
+failure cache.
+
+Known limitation: the 1 second timeout includes the time spent queued for one
+of the 4 lookup threads. If a client's first lookup times out (a burst of many
+new clients, or a hung DNS server tying up the workers), that client is counted
+under its IP for up to 5 minutes, then switches to its name.
+
+The `hostname` label is always present and equals `client` when resolution is
+off. Upgrading therefore starts new series once, and queries such as
+`sum by (model, client)` keep working.
+
+```sh
+docker run -d --name ollama-exporter -p 8000:8000 ollama-exporter \
+  --ollama-host http://192.168.1.100:11434 \
+  --track-clients --resolve-clients \
+  --client-hostname-ignore '\.ipv6\.obeone\.org$'
 ```
 
 ## Grafana Integration
