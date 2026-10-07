@@ -105,6 +105,227 @@ def test_timeout_falls_back_to_ip():
         release.set()
 
 
+def _late_lookup_scenario(result, ignore=None):
+    """Time a lookup out, release it, and wait for its late result to land.
+
+    Parameters
+    ----------
+    result : str or BaseException
+        What the lookup returns or raises once released.
+    ignore : re.Pattern, optional
+        Ignore pattern given to the resolver.
+
+    Returns
+    -------
+    tuple
+        ``(resolver, lookup, first, second)``: the resolver, the counting
+        lookup, the name served at timeout time and the name served by a
+        second ``with_hostname`` call after the late result was processed.
+    """
+    release = threading.Event()
+    calls = []
+
+    def lookup(ip):
+        """Block until released, then return or raise ``result``."""
+        calls.append(ip)
+        release.wait(5)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    lookup.calls = calls
+    resolver = ClientNameResolver(lookup=lookup, timeout=0.05, ignore=ignore)
+
+    async def run():
+        """Wait for the timeout, release the thread, await the late callback."""
+        loop = asyncio.get_running_loop()
+        landed = asyncio.Event()
+        original = resolver._on_late_result
+
+        def spy(ip, future):
+            """Run the real handler, then signal the test."""
+            original(ip, future)
+            landed.set()
+
+        resolver._on_late_result = spy
+        first = loop.create_future()
+        resolver.with_hostname(IP, first.set_result)
+        first_name = await asyncio.wait_for(first, 2)
+        release.set()
+        await asyncio.wait_for(landed.wait(), 2)
+        second = loop.create_future()
+        resolver.with_hostname(IP, second.set_result)
+        return first_name, await asyncio.wait_for(second, 2)
+
+    try:
+        first_name, second_name = asyncio.run(run())
+    finally:
+        release.set()
+    return resolver, lookup, first_name, second_name
+
+
+def test_late_success_fills_the_cache():
+    """A lookup finishing after the timeout still caches its name."""
+    resolver, lookup, first, second = _late_lookup_scenario("Late.Example.")
+    assert first == IP
+    assert second == "late.example"
+    assert lookup.calls == [IP]
+
+
+def test_late_success_honours_the_ignore_pattern():
+    """A late name matching the ignore regex is cached as the IP."""
+    resolver, lookup, first, second = _late_lookup_scenario(
+        "x.ipv6.example", ignore=re.compile(r"\.ipv6\.example$")
+    )
+    assert second == IP
+    assert lookup.calls == [IP]
+
+
+def test_late_failure_keeps_the_negative_entry():
+    """A lookup failing after the timeout changes nothing in the cache."""
+    resolver, lookup, first, second = _late_lookup_scenario(
+        socket.herror(1, "Unknown host")
+    )
+    assert first == IP
+    assert second == IP
+    # Still the negative entry written at timeout time: no second lookup.
+    assert lookup.calls == [IP]
+    assert resolver._cache[IP][0] == IP
+
+
+def test_late_success_respects_the_lru_bound():
+    """A late result goes through the bounded insert helper."""
+    release = threading.Event()
+    resolver = ClientNameResolver(
+        lookup=lambda ip: release.wait(5) and "late.example", timeout=0.05, max_size=1
+    )
+
+    async def run():
+        """Time out, then fill the single slot with another address first."""
+        loop = asyncio.get_running_loop()
+        landed = asyncio.Event()
+        original = resolver._on_late_result
+
+        def spy(ip, future):
+            """Run the real handler, then signal the test."""
+            original(ip, future)
+            landed.set()
+
+        resolver._on_late_result = spy
+        first = loop.create_future()
+        resolver.with_hostname(IP, first.set_result)
+        await asyncio.wait_for(first, 2)
+        resolver._store("192.0.2.99", "other.lan", 60)
+        release.set()
+        await asyncio.wait_for(landed.wait(), 2)
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+    assert list(resolver._cache) == [IP]
+
+
+def _late_guard_resolver(result):
+    """Build a resolver whose lookup blocks until released, with a fake clock.
+
+    Parameters
+    ----------
+    result : str or BaseException
+        What the lookup returns or raises once released.
+
+    Returns
+    -------
+    tuple
+        ``(resolver, lookup, clock, release)``.
+    """
+    release = threading.Event()
+    calls = []
+
+    def lookup(ip):
+        """Block until released, then return or raise ``result``."""
+        calls.append(ip)
+        release.wait(5)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    lookup.calls = calls
+    clock = FakeClock()
+    resolver = ClientNameResolver(
+        lookup=lookup, timeout=0.05, negative_ttl=300, ttl=3600, clock=clock
+    )
+    return resolver, lookup, clock, release
+
+
+def _late_guard_scenario(result):
+    """Time out, retry after the negative TTL while stuck, then release.
+
+    Parameters
+    ----------
+    result : str or BaseException
+        What the stuck lookup finally returns or raises.
+
+    Returns
+    -------
+    tuple
+        ``(resolver, lookup, retry_name, late_before, late_after)`` where the
+        last two are snapshots of ``_late`` while stuck and after release.
+    """
+    resolver, lookup, clock, release = _late_guard_resolver(result)
+
+    async def run():
+        """Run the timeout, the guarded retry, then the release."""
+        loop = asyncio.get_running_loop()
+        landed = asyncio.Event()
+        original = resolver._on_late_result
+
+        def spy(ip, future):
+            """Run the real handler, then signal the test."""
+            original(ip, future)
+            landed.set()
+
+        resolver._on_late_result = spy
+        first = loop.create_future()
+        resolver.with_hostname(IP, first.set_result)
+        await asyncio.wait_for(first, 2)
+        clock.now += 301  # negative entry expired: a retry is due
+        retry = loop.create_future()
+        resolver.with_hostname(IP, retry.set_result)
+        retry_name = await asyncio.wait_for(retry, 2)
+        late_before = dict(resolver._late)
+        release.set()
+        await asyncio.wait_for(landed.wait(), 2)
+        return retry_name, late_before, dict(resolver._late)
+
+    try:
+        retry_name, late_before, late_after = asyncio.run(run())
+    finally:
+        release.set()
+    return resolver, lookup, retry_name, late_before, late_after
+
+
+def test_stuck_late_lookup_is_not_duplicated_and_fills_cache_once_released():
+    """A retry while the late lookup is stuck gets the fallback, no new job."""
+    resolver, lookup, retry, before, after = _late_guard_scenario("Late.Example.")
+    assert retry == IP
+    assert list(before) == [IP]
+    assert lookup.calls == [IP]
+    assert after == {}
+    assert resolver._cache[IP][0] == "late.example"
+
+
+def test_late_failure_clears_the_late_guard():
+    """A late failure also releases the guard, keeping the negative entry."""
+    resolver, lookup, retry, before, after = _late_guard_scenario(
+        socket.herror(1, "Unknown host")
+    )
+    assert retry == IP
+    assert list(before) == [IP]
+    assert lookup.calls == [IP]
+    assert after == {}
+
+
 def test_nxdomain_uses_ip_and_negative_ttl():
     """A definitive failure gives the IP, cached until negative_ttl elapses."""
     clock = FakeClock()
@@ -424,6 +645,35 @@ def test_parse_args_cli_overrides_env(monkeypatch):
     assert args.client_hostname_ignore.pattern == "cli"
 
 
+def test_parse_args_timeout_default(monkeypatch):
+    """The lookup timeout defaults to 3 seconds."""
+    monkeypatch.delenv("EXPORTER_CLIENT_HOSTNAME_TIMEOUT", raising=False)
+    assert ollama_exporter.parse_args([]).client_hostname_timeout == 3.0
+
+
+def test_parse_args_timeout_env_and_cli(monkeypatch):
+    """The environment sets the timeout and the CLI flag wins over it."""
+    monkeypatch.setenv("EXPORTER_CLIENT_HOSTNAME_TIMEOUT", "5.5")
+    assert ollama_exporter.parse_args([]).client_hostname_timeout == 5.5
+    args = ollama_exporter.parse_args(["--client-hostname-timeout", "0.25"])
+    assert args.client_hostname_timeout == 0.25
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "-0.5", "abc", "", "nan"])
+def test_parse_args_timeout_rejects_invalid_cli(value):
+    """Zero, negative and non-numeric timeouts make argparse exit."""
+    with pytest.raises(SystemExit):
+        ollama_exporter.parse_args(["--client-hostname-timeout", value])
+
+
+@pytest.mark.parametrize("value", ["0", "-3", "abc"])
+def test_parse_args_timeout_rejects_invalid_env(monkeypatch, value):
+    """An invalid environment value is rejected like an invalid flag."""
+    monkeypatch.setenv("EXPORTER_CLIENT_HOSTNAME_TIMEOUT", value)
+    with pytest.raises(SystemExit):
+        ollama_exporter.parse_args([])
+
+
 def _run_main(monkeypatch, argv, serve_hook=None):
     """Run main() against stubbed uvicorn and return nothing.
 
@@ -474,6 +724,17 @@ def test_main_sets_resolver_with_track_and_resolve(monkeypatch):
     assert isinstance(resolver, ClientNameResolver)
     assert resolver.ignore.pattern == "x$"
     # Restore before teardown so the resolver does not leak into other tests.
+    monkeypatch.setattr(ollama_exporter, "CLIENT_RESOLVER", None)
+
+
+def test_main_passes_the_timeout_to_the_resolver(monkeypatch):
+    """--client-hostname-timeout reaches the ClientNameResolver."""
+    monkeypatch.setattr(ollama_exporter, "CLIENT_RESOLVER", None)
+    _run_main(
+        monkeypatch,
+        ["--track-clients", "--resolve-clients", "--client-hostname-timeout", "7"],
+    )
+    assert ollama_exporter.CLIENT_RESOLVER.timeout == 7.0
     monkeypatch.setattr(ollama_exporter, "CLIENT_RESOLVER", None)
 
 

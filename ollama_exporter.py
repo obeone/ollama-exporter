@@ -37,9 +37,10 @@ DEFAULT_FORWARDED_ALLOW_IPS = "127.0.0.1,::1"
 TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
 
 # Reverse DNS (PTR) resolution of client addresses, see ClientNameResolver.
-# A lookup slower than this is abandoned: the request never waits for it, only
-# the metric increment does.
-DEFAULT_RESOLVE_TIMEOUT = 1.0
+# A lookup slower than this stops holding back the metric increment (the
+# request itself never waits); its result still fills the cache when it ends.
+# A cold PTR lookup of an IPv6 client was measured at 1.13 s in production.
+DEFAULT_RESOLVE_TIMEOUT = 3.0
 # How long a resolved name (or an ignored one) is trusted.
 DEFAULT_RESOLVE_TTL = 3600.0
 # How long a failed lookup is remembered, so an address without a PTR record
@@ -226,11 +227,19 @@ class ClientNameResolver:
     previously known name, so a DNS outage does not flip an established series
     back to the IP.
 
+    Late results: a lookup that outlives ``timeout`` is not discarded. The
+    waiting callbacks are released with the fallback right away, but the
+    lookup thread keeps running and, if it eventually succeeds, its name
+    replaces the negative cache entry with the positive TTL. A late failure
+    changes nothing.
+
     Known limitation: ``timeout`` includes the time spent queued for one of the
     ``RESOLVE_WORKERS`` lookup threads. If a client's first lookup times out
     (a burst of many new clients, or a hung DNS server tying up the workers),
-    that client is counted under its IP for up to ``negative_ttl``, then
-    switches to its name.
+    only the requests counted while that first lookup was pending land under
+    the IP; once the lookup finishes, later requests use the name. A lookup
+    that never finishes still leaves the client under its IP for up to
+    ``negative_ttl``.
 
     Parameters
     ----------
@@ -280,6 +289,11 @@ class ClientNameResolver:
         self._cache = OrderedDict()
         # ip -> callbacks waiting for the single lookup running for that ip.
         self._pending = {}
+        # ip -> executor future of a lookup that outlived its timeout and is
+        # still running. While present, no new lookup is submitted for that ip:
+        # it bounds the executor queue to one job per address during a DNS hang
+        # and stops an old late result from racing a newer lookup.
+        self._late = {}
         # Strong references: the loop only keeps weak ones to running tasks.
         self._tasks = set()
 
@@ -377,14 +391,26 @@ class ClientNameResolver:
         # finally block guarantees the callbacks run whatever happens.
         final = ip
         try:
+            if ip in self._late:
+                # A previous lookup of this ip is still stuck in a thread:
+                # serve the usual transient fallback instead of piling up
+                # another job behind it.
+                final = self._on_transient_failure(ip, "late lookup still running")
+                return
             loop = asyncio.get_running_loop()
+            lookup_future = loop.run_in_executor(self._executor, self._lookup, ip)
             try:
+                # shield: wait_for must only abandon the wait, not cancel the
+                # lookup, so its result can still be used if it arrives late.
                 raw = await asyncio.wait_for(
-                    loop.run_in_executor(self._executor, self._lookup, ip),
-                    self.timeout,
+                    asyncio.shield(lookup_future), self.timeout
                 )
             except (TimeoutError, asyncio.TimeoutError):
                 final = self._on_transient_failure(ip, "timed out")
+                self._late[ip] = lookup_future
+                lookup_future.add_done_callback(
+                    lambda fut: self._on_late_result(ip, fut)
+                )
             except socket.herror as exc:
                 if exc.errno == 2:  # TRY_AGAIN: the resolver is flaky, not definitive
                     final = self._on_transient_failure(ip, f"temporary failure ({exc})")
@@ -413,6 +439,42 @@ class ClientNameResolver:
                 except Exception:
                     # One bad callback must not starve the others.
                     logger.exception(f"Client hostname callback failed for {ip}")
+
+    def _on_late_result(self, ip, future):
+        """Cache the outcome of a lookup that finished after its timeout.
+
+        Runs on the event loop thread (asyncio future callback). It always
+        releases the ``_late`` guard first, whatever the outcome, so the next
+        lookup of the address is allowed again. Only a success is used: a failure must not overwrite the stale name or the
+        negative entry already in place, and a cancelled lookup (``close()``)
+        is ignored.
+
+        Parameters
+        ----------
+        ip : str
+            Address that was being resolved.
+        future : asyncio.Future
+            The finished lookup future.
+        """
+        if self._late.get(ip) is future:
+            del self._late[ip]
+        if future.cancelled():
+            return
+        # Retrieving the exception also silences "never retrieved" warnings.
+        exc = future.exception()
+        if exc is not None:
+            logger.debug(f"Late reverse lookup of {ip} failed: {exc}")
+            return
+        try:
+            name = self._normalize(future.result())
+            if self.ignore is not None and self.ignore.search(name):
+                logger.debug(f"Late hostname {name} of {ip} matches the ignore pattern")
+                self._store(ip, ip, self.ttl)
+            else:
+                logger.debug(f"Late lookup resolved {ip} to {name}")
+                self._store(ip, name, self.ttl)
+        except Exception:
+            logger.exception(f"Unexpected error caching late lookup of {ip}")
 
     def _on_transient_failure(self, ip, reason):
         """Handle a retryable failure, keeping any previously known name.
@@ -963,6 +1025,37 @@ async def verify_ollama_connection():
         logger.error(f"Failed to connect to Ollama server at {OLLAMA_HOST}: {e}")
         logger.error("Please ensure Ollama is running and accessible at the configured host")
 
+def positive_float(value):
+    """Parse a CLI/env value as a strictly positive float.
+
+    argparse also applies ``type`` to string defaults, so a bad environment
+    variable is rejected the same way as a bad flag.
+
+    Parameters
+    ----------
+    value : str or float
+        Value to convert.
+
+    Returns
+    -------
+    float
+        The parsed number, greater than zero.
+
+    Raises
+    ------
+    argparse.ArgumentTypeError
+        If ``value`` is not a number or is not greater than zero.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"invalid number: {value!r}")
+    # NaN fails this comparison too, which is what we want.
+    if not number > 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0: {value!r}")
+    return number
+
+
 def regex_or_none(value):
     """Compile a CLI/env regex, mapping an empty string to ``None``.
 
@@ -1009,8 +1102,8 @@ def parse_args(argv=None):
         Parsed arguments with ``host``, ``port``, ``ollama_host``,
         ``request_timeout``, ``log_level``, ``track_clients`` (bool),
         ``resolve_clients`` (bool), ``client_hostname_ignore``
-        (``re.Pattern`` or ``None``) and ``forwarded_allow_ips`` (str)
-        attributes.
+        (``re.Pattern`` or ``None``), ``client_hostname_timeout`` (float,
+        seconds, > 0) and ``forwarded_allow_ips`` (str) attributes.
     """
     parser = argparse.ArgumentParser(
         description="Prometheus exporter and metrics-extracting proxy for Ollama."
@@ -1067,6 +1160,14 @@ def parse_args(argv=None):
         default=os.getenv("EXPORTER_CLIENT_HOSTNAME_IGNORE", ""),
         help="Case-insensitive regex; resolved hostnames matching it (re.search) "
              "fall back to the client IP.",
+    )
+    parser.add_argument(
+        "--client-hostname-timeout",
+        type=positive_float,
+        default=os.getenv("EXPORTER_CLIENT_HOSTNAME_TIMEOUT", DEFAULT_RESOLVE_TIMEOUT),
+        help="Seconds after which a reverse lookup stops delaying the counter "
+             "increment; a lookup finishing later still fills the cache "
+             "(default: %(default)s).",
     )
     parser.add_argument(
         "--forwarded-allow-ips",
@@ -1147,7 +1248,10 @@ async def main():
     if args.resolve_clients and not args.track_clients:
         logger.warning("--resolve-clients has no effect without --track-clients")
     elif args.resolve_clients:
-        CLIENT_RESOLVER = ClientNameResolver(ignore=args.client_hostname_ignore)
+        CLIENT_RESOLVER = ClientNameResolver(
+            ignore=args.client_hostname_ignore,
+            timeout=args.client_hostname_timeout,
+        )
 
     await verify_ollama_connection()
     config = uvicorn.Config(
