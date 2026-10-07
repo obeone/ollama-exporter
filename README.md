@@ -73,6 +73,7 @@ docker restart <prometheus-container-name>
 | Metric Name | Description |
 |------------|-------------|
 | `ollama_requests_total` | Total chat and generate requests |
+| `ollama_client_requests_total` | Chat and generate requests per source client (optional, see [Per-client metrics](#per-client-metrics)) |
 | `ollama_response_seconds` | Total time spent for the response |
 | `ollama_load_duration_seconds` | Time spent loading the model |
 | `ollama_prompt_eval_duration_seconds` | Time spent evaluating prompt |
@@ -80,6 +81,30 @@ docker restart <prometheus-container-name>
 | `ollama_tokens_processed_total` | Number of tokens in the prompt |
 | `ollama_tokens_generated_total` | Number of tokens in the response |
 | `ollama_tokens_per_second` | Tokens generated per second |
+
+## Per-client metrics
+
+`ollama_client_requests_total{model, client}` counts chat and generate requests
+per source client. It is disabled by default because a client address label has
+unbounded cardinality and can bloat Prometheus on a busy or exposed instance.
+Enable it only on networks where the set of clients is small and known.
+
+| Flag | Environment variable | Description |
+|------|----------------------|-------------|
+| `--track-clients` | `EXPORTER_TRACK_CLIENTS` | Enable the counter (`1`, `true`, `yes` or `on`) |
+| `--forwarded-allow-ips` | `FORWARDED_ALLOW_IPS` | Comma-separated IPs/CIDRs, or `*`, allowed to set `X-Forwarded-For` (default `127.0.0.1`) |
+
+Behind a reverse proxy, the client is read from `X-Forwarded-For`, but only when
+the direct peer is listed in `--forwarded-allow-ips`. Requests from any other
+peer have the header ignored, so a client cannot spoof its address. Trust only
+your own proxies, and avoid `*` unless the exporter is unreachable except
+through them.
+
+```sh
+docker run -d --name ollama-exporter -p 8000:8000 ollama-exporter \
+  --ollama-host http://192.168.1.100:11434 \
+  --track-clients --forwarded-allow-ips 10.0.0.0/8
+```
 
 ## Grafana Integration
 1. Open **Grafana**.
