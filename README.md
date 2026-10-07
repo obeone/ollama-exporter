@@ -125,6 +125,7 @@ Enable it only on networks where the set of clients is small and known.
 | `--track-clients` | `EXPORTER_TRACK_CLIENTS` | Enable the counter (`1`, `true`, `yes` or `on`) |
 | `--resolve-clients` | `EXPORTER_RESOLVE_CLIENTS` | Fill `hostname` with the client's reverse DNS name (same truthy values); needs `--track-clients` |
 | `--client-hostname-ignore` | `EXPORTER_CLIENT_HOSTNAME_IGNORE` | Case-insensitive regex; resolved names matching it fall back to the IP |
+| `--client-hostname-timeout` | `EXPORTER_CLIENT_HOSTNAME_TIMEOUT` | Seconds a reverse lookup may delay the counter increment, greater than 0 (default `3`); a lookup finishing later still fills the cache |
 | `--forwarded-allow-ips` | `FORWARDED_ALLOW_IPS` | Comma-separated IPs/CIDRs, or `*`, allowed to set `X-Forwarded-For` (default `127.0.0.1,::1`) |
 
 Behind a reverse proxy, the client is read from `X-Forwarded-For`, but only when
@@ -144,7 +145,7 @@ docker run -d --name ollama-exporter -p 8000:8000 ollama-exporter \
 
 With `--resolve-clients`, the `hostname` label holds the reverse DNS (PTR) name
 of `client`, lowercased and without the trailing dot. Lookups run in a small
-background thread pool and are bounded: 1 second timeout, a cache of 4096
+background thread pool and are bounded: 3 second timeout (`--client-hostname-timeout`), a cache of 4096
 addresses (least recently used evicted first), 1 hour for a found name and
 5 minutes for a failure. A timeout or a temporary resolver error keeps the
 previously known name, so a DNS blip does not flip an established series back
@@ -157,16 +158,25 @@ handy for auto-generated names that say nothing, for example
 
 Requests never wait for a lookup. The first requests of an unknown client are
 normally not counted under the IP: the proxied request goes through
-immediately, and the counter increment is deferred until the lookup ends (1
-second at most), landing directly under the final hostname. Every request
+immediately, and the counter increment is deferred until the lookup ends (3
+seconds at most by default), landing directly under the final hostname. Every request
 increments exactly one series. A series changes hostname if the PTR record
 itself changes, or if a client that had no name gains one after the 5 minute
 failure cache.
 
-Known limitation: the 1 second timeout includes the time spent queued for one
-of the 4 lookup threads. If a client's first lookup times out (a burst of many
-new clients, or a hung DNS server tying up the workers), that client is counted
-under its IP for up to 5 minutes, then switches to its name.
+A lookup that takes longer than the timeout is not thrown away: the requests
+waiting on it are counted under the IP right away, but the lookup keeps running
+and, if it succeeds, its name fills the cache with the normal 1 hour lifetime.
+Only the requests counted during that first lookup land under the IP. A late
+failure changes nothing.
+
+Known limitation: the timeout includes the time spent queued for one of the 4
+lookup threads. If a client's first lookup times out (a burst of many new
+clients, or a hung DNS server tying up the workers), the requests counted
+before it ends use the IP. A lookup that never finishes leaves the client under
+its IP for up to 5 minutes, until the next attempt. While such a lookup is
+still running, no second lookup is started for the same IP, so a DNS hang
+queues at most one job per distinct client.
 
 The `hostname` label is always present and equals `client` when resolution is
 off. Upgrading therefore starts new series once, and queries such as
