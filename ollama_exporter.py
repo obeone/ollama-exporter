@@ -1,11 +1,15 @@
 import os
 import argparse
 import asyncio
+import concurrent.futures
 import httpx
 import ipaddress
 import json
 import logging
+import re
 import socket
+import time
+from collections import OrderedDict
 from urllib.parse import urlsplit
 
 import anyio
@@ -32,6 +36,21 @@ DEFAULT_FORWARDED_ALLOW_IPS = "127.0.0.1,::1"
 # Values accepted as "true" for boolean environment variables.
 TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
 
+# Reverse DNS (PTR) resolution of client addresses, see ClientNameResolver.
+# A lookup slower than this is abandoned: the request never waits for it, only
+# the metric increment does.
+DEFAULT_RESOLVE_TIMEOUT = 1.0
+# How long a resolved name (or an ignored one) is trusted.
+DEFAULT_RESOLVE_TTL = 3600.0
+# How long a failed lookup is remembered, so an address without a PTR record
+# (or a dead resolver) is not queried again on every request.
+DEFAULT_RESOLVE_NEGATIVE_TTL = 300.0
+# Upper bound on cached addresses, so a scan cannot grow the cache forever.
+DEFAULT_RESOLVE_MAX_SIZE = 4096
+# Concurrent blocking lookups: gethostbyaddr has no async form, and a small
+# dedicated pool keeps a slow resolver from starving asyncio's default executor.
+RESOLVE_WORKERS = 4
+
 # Fallback when the host has no usable IPv6 stack (see bind_listen_socket).
 IPV4_WILDCARD = "0.0.0.0"
 
@@ -46,6 +65,11 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
 # Whether to count requests per source client. Populated by parse_args(); off
 # by default because a client address label has unbounded cardinality.
 TRACK_CLIENTS = False
+
+# Reverse DNS resolver for the `hostname` label. Populated by main() only when
+# --track-clients and --resolve-clients are both set; None means the label
+# simply repeats the client address.
+CLIENT_RESOLVER = None
 
 # Total deadline applied to inference requests, populated the same way.
 REQUEST_TIMEOUT = float(os.getenv("EXPORTER_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT))
@@ -74,7 +98,9 @@ OLLAMA_CHAT_REQUEST_COUNT = Counter("ollama_requests_total", "Total chat request
 OLLAMA_CLIENT_REQUEST_COUNT = Counter(
     "ollama_client_requests_total",
     "Chat and generate requests per source client",
-    ["model", "client"],
+    # `hostname` is always part of the schema (equal to `client` when
+    # resolution is off) so the series shape does not depend on a flag.
+    ["model", "client", "hostname"],
 )
 OLLAMA_INFLIGHT = Gauge("ollama_inflight_requests", "Inference requests currently proxied to Ollama", ["model"])
 
@@ -162,6 +188,252 @@ class UnmapIPv4Middleware:
             if mapped is not None:
                 scope["client"] = (str(mapped), client[1])
         await self.app(scope, receive, send)
+
+
+def default_ptr_lookup(ip):
+    """Return the reverse DNS name of an IP address.
+
+    Parameters
+    ----------
+    ip : str
+        IP address literal.
+
+    Returns
+    -------
+    str
+        First name returned by ``socket.gethostbyaddr``.
+
+    Raises
+    ------
+    OSError
+        ``socket.herror`` or ``socket.gaierror`` when no name can be found.
+    """
+    return socket.gethostbyaddr(ip)[0]
+
+
+class ClientNameResolver:
+    """Resolve client IPs to hostnames without ever blocking a request.
+
+    Counting decision: the first request(s) of an unknown client are NOT
+    counted under the IP and do NOT wait. The proxied request proceeds
+    immediately; the counter increment is deferred until the lookup ends (at
+    most ``timeout`` seconds later) and lands directly under the final
+    hostname. In the normal case a client's series is therefore born with its
+    final hostname, and every request increments exactly one series (no double
+    count). A series can still change hostname when the PTR record itself
+    changes, or when a client that had no name gains one after
+    ``negative_ttl``. A transient failure (timeout, ``TRY_AGAIN``) keeps the
+    previously known name, so a DNS outage does not flip an established series
+    back to the IP.
+
+    Known limitation: ``timeout`` includes the time spent queued for one of the
+    ``RESOLVE_WORKERS`` lookup threads. If a client's first lookup times out
+    (a burst of many new clients, or a hung DNS server tying up the workers),
+    that client is counted under its IP for up to ``negative_ttl``, then
+    switches to its name.
+
+    Parameters
+    ----------
+    ignore : re.Pattern, optional
+        Resolved names matching it (``re.search`` on the normalized name) fall
+        back to the IP, e.g. auto-generated reverse names that carry no
+        information.
+    timeout : float, optional
+        Seconds before a lookup is abandoned.
+    ttl : float, optional
+        Seconds a resolved (or ignored) name stays cached.
+    negative_ttl : float, optional
+        Seconds a failed lookup stays cached.
+    max_size : int, optional
+        Maximum number of cached addresses; the least recently used is
+        evicted first.
+    lookup : callable, optional
+        Blocking ``lookup(ip) -> name`` function, replaceable in tests.
+    clock : callable, optional
+        Monotonic time source, replaceable in tests.
+    """
+
+    def __init__(
+        self,
+        ignore=None,
+        timeout=DEFAULT_RESOLVE_TIMEOUT,
+        ttl=DEFAULT_RESOLVE_TTL,
+        negative_ttl=DEFAULT_RESOLVE_NEGATIVE_TTL,
+        max_size=DEFAULT_RESOLVE_MAX_SIZE,
+        lookup=default_ptr_lookup,
+        clock=time.monotonic,
+    ):
+        """Store the settings and create the empty cache and worker pool."""
+        self.ignore = ignore
+        self.timeout = timeout
+        self.ttl = ttl
+        self.negative_ttl = negative_ttl
+        self.max_size = max_size
+        self._lookup = lookup
+        self._clock = clock
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=RESOLVE_WORKERS, thread_name_prefix="ptr"
+        )
+        # ip -> (name, expires_at), least recently used first. Expired entries
+        # are kept on purpose: they are the "stale" value used on transient
+        # errors, and are overwritten on refresh.
+        self._cache = OrderedDict()
+        # ip -> callbacks waiting for the single lookup running for that ip.
+        self._pending = {}
+        # Strong references: the loop only keeps weak ones to running tasks.
+        self._tasks = set()
+
+    def with_hostname(self, ip, callback):
+        """Call ``callback(hostname)`` exactly once, never blocking.
+
+        The callback runs synchronously for a non-IP input or a fresh cache
+        hit, otherwise once the background lookup for ``ip`` has finished.
+        Must be called from a running event loop.
+
+        Parameters
+        ----------
+        ip : str
+            Client address, or a placeholder such as ``"unknown"``.
+        callback : callable
+            Receives the hostname, or ``ip`` itself when none is usable.
+        """
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            # Nothing to reverse: do not waste a lookup on "unknown".
+            callback(ip)
+            return
+
+        entry = self._cache.get(ip)
+        if entry is not None and entry[1] > self._clock():
+            self._cache.move_to_end(ip)
+            callback(entry[0])
+            return
+
+        waiting = self._pending.get(ip)
+        if waiting is not None:
+            # One lookup per address, however many requests arrive meanwhile.
+            waiting.append(callback)
+            return
+        # Created before registering, so a failure here leaves no orphan entry
+        # in _pending that would swallow every later callback for this ip.
+        task = asyncio.get_running_loop().create_task(self._resolve(ip))
+        self._pending[ip] = [callback]
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def close(self):
+        """Shut the lookup thread pool down without waiting for its threads.
+
+        A stuck ``gethostbyaddr`` cannot be interrupted, so waiting for it
+        would delay process exit (and, on Kubernetes, eat the termination
+        grace period). Queued lookups are cancelled; running ones are left to
+        finish in the background.
+        """
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _normalize(self, name):
+        """Strip the root dot and lowercase a DNS name.
+
+        Parameters
+        ----------
+        name : str
+            Name as returned by the resolver.
+
+        Returns
+        -------
+        str
+            Canonical form, so ``Host.Example.`` and ``host.example`` share a
+            series.
+        """
+        return name.rstrip(".").lower()
+
+    def _store(self, ip, name, ttl):
+        """Cache ``name`` for ``ip`` and evict the oldest entry past the bound.
+
+        Parameters
+        ----------
+        ip : str
+            Address the name belongs to.
+        name : str
+            Hostname, or ``ip`` for a negative entry.
+        ttl : float
+            Seconds the entry stays fresh.
+        """
+        self._cache[ip] = (name, self._clock() + ttl)
+        self._cache.move_to_end(ip)
+        while len(self._cache) > self.max_size:
+            self._cache.popitem(last=False)
+
+    async def _resolve(self, ip):
+        """Look ``ip`` up, cache the outcome and release the waiting callbacks.
+
+        Parameters
+        ----------
+        ip : str
+            Address to resolve.
+        """
+        # Falls back to the IP unless a branch below settles on a name; the
+        # finally block guarantees the callbacks run whatever happens.
+        final = ip
+        try:
+            loop = asyncio.get_running_loop()
+            try:
+                raw = await asyncio.wait_for(
+                    loop.run_in_executor(self._executor, self._lookup, ip),
+                    self.timeout,
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                final = self._on_transient_failure(ip, "timed out")
+            except socket.herror as exc:
+                if exc.errno == 2:  # TRY_AGAIN: the resolver is flaky, not definitive
+                    final = self._on_transient_failure(ip, f"temporary failure ({exc})")
+                else:
+                    logger.debug(f"No PTR record for {ip}: {exc}")
+                    self._store(ip, ip, self.negative_ttl)
+            except OSError as exc:
+                logger.debug(f"Reverse lookup of {ip} failed: {exc}")
+                self._store(ip, ip, self.negative_ttl)
+            else:
+                name = self._normalize(raw)
+                if self.ignore is not None and self.ignore.search(name):
+                    logger.debug(f"Hostname {name} of {ip} matches the ignore pattern")
+                    self._store(ip, ip, self.ttl)
+                else:
+                    logger.debug(f"Resolved {ip} to {name}")
+                    final = name
+                    self._store(ip, name, self.ttl)
+        except Exception:
+            logger.exception(f"Unexpected error resolving {ip}")
+            self._store(ip, ip, self.negative_ttl)
+        finally:
+            for callback in self._pending.pop(ip, []):
+                try:
+                    callback(final)
+                except Exception:
+                    # One bad callback must not starve the others.
+                    logger.exception(f"Client hostname callback failed for {ip}")
+
+    def _on_transient_failure(self, ip, reason):
+        """Handle a retryable failure, keeping any previously known name.
+
+        Parameters
+        ----------
+        ip : str
+            Address that failed to resolve.
+        reason : str
+            Short description for the debug log.
+
+        Returns
+        -------
+        str
+            The previous name when one exists (stale on error), else ``ip``.
+        """
+        previous = self._cache.get(ip)
+        name = previous[0] if previous is not None else ip
+        logger.debug(f"Reverse lookup of {ip} {reason}, using {name}")
+        self._store(ip, name, self.negative_ttl)
+        return name
 
 
 def build_asgi_app(forwarded_allow_ips):
@@ -644,7 +916,21 @@ async def proxy(request: Request, path: str):
         # request.client with the X-Forwarded-For address when the direct peer
         # is trusted, so no header parsing is needed (or wanted) here.
         client_host = request.client.host if request.client else "unknown"
-        OLLAMA_CLIENT_REQUEST_COUNT.labels(model=model, client=client_host).inc()
+        if CLIENT_RESOLVER is None:
+            OLLAMA_CLIENT_REQUEST_COUNT.labels(
+                model=model, client=client_host, hostname=client_host
+            ).inc()
+        else:
+            # The increment may be deferred by up to the lookup timeout so
+            # that it lands directly under the final hostname; the request
+            # itself is not delayed (see ClientNameResolver).
+            def count(hostname):
+                """Increment the per-client counter under ``hostname``."""
+                OLLAMA_CLIENT_REQUEST_COUNT.labels(
+                    model=model, client=client_host, hostname=hostname
+                ).inc()
+
+            CLIENT_RESOLVER.with_hostname(client_host, count)
 
     return UpstreamProxyResponse(
         method=request.method,
@@ -677,6 +963,35 @@ async def verify_ollama_connection():
         logger.error(f"Failed to connect to Ollama server at {OLLAMA_HOST}: {e}")
         logger.error("Please ensure Ollama is running and accessible at the configured host")
 
+def regex_or_none(value):
+    """Compile a CLI/env regex, mapping an empty string to ``None``.
+
+    argparse also applies ``type`` to string defaults, and an empty pattern
+    would match every name, so empty must mean "no filter".
+
+    Parameters
+    ----------
+    value : str
+        Regular expression source.
+
+    Returns
+    -------
+    re.Pattern or None
+        Case-insensitive compiled pattern, or ``None`` when ``value`` is empty.
+
+    Raises
+    ------
+    argparse.ArgumentTypeError
+        If ``value`` is not a valid regular expression.
+    """
+    if not value:
+        return None
+    try:
+        return re.compile(value, re.IGNORECASE)
+    except re.error as exc:
+        raise argparse.ArgumentTypeError(f"invalid regular expression {value!r}: {exc}")
+
+
 def parse_args(argv=None):
     """Parse command-line arguments.
 
@@ -692,8 +1007,10 @@ def parse_args(argv=None):
     -------
     argparse.Namespace
         Parsed arguments with ``host``, ``port``, ``ollama_host``,
-        ``request_timeout``, ``log_level``, ``track_clients`` (bool) and
-        ``forwarded_allow_ips`` (str) attributes.
+        ``request_timeout``, ``log_level``, ``track_clients`` (bool),
+        ``resolve_clients`` (bool), ``client_hostname_ignore``
+        (``re.Pattern`` or ``None``) and ``forwarded_allow_ips`` (str)
+        attributes.
     """
     parser = argparse.ArgumentParser(
         description="Prometheus exporter and metrics-extracting proxy for Ollama."
@@ -736,6 +1053,20 @@ def parse_args(argv=None):
         help="Count chat/generate requests per source client "
              "(ollama_client_requests_total). Off by default: the client label "
              "has unbounded cardinality.",
+    )
+    parser.add_argument(
+        "--resolve-clients",
+        action="store_true",
+        default=os.getenv("EXPORTER_RESOLVE_CLIENTS", "").strip().lower() in TRUTHY_VALUES,
+        help="Add the reverse DNS name of each client as the hostname label of "
+             "ollama_client_requests_total. Requires --track-clients.",
+    )
+    parser.add_argument(
+        "--client-hostname-ignore",
+        type=regex_or_none,
+        default=os.getenv("EXPORTER_CLIENT_HOSTNAME_IGNORE", ""),
+        help="Case-insensitive regex; resolved hostnames matching it (re.search) "
+             "fall back to the client IP.",
     )
     parser.add_argument(
         "--forwarded-allow-ips",
@@ -802,9 +1133,10 @@ async def main():
 
     Sets the module-level ``OLLAMA_HOST``, ``REQUEST_TIMEOUT`` and
     ``TRACK_CLIENTS`` from the parsed arguments before serving, since request
-    handlers read them there.
+    handlers read them there. ``CLIENT_RESOLVER`` is created only when both
+    ``--track-clients`` and ``--resolve-clients`` are set.
     """
-    global OLLAMA_HOST, REQUEST_TIMEOUT, TRACK_CLIENTS
+    global OLLAMA_HOST, REQUEST_TIMEOUT, TRACK_CLIENTS, CLIENT_RESOLVER
     args = parse_args()
 
     # CLI/env arguments override the module-level defaults set at import time.
@@ -812,6 +1144,10 @@ async def main():
     REQUEST_TIMEOUT = args.request_timeout
     TRACK_CLIENTS = args.track_clients
     logger.setLevel(getattr(logging, args.log_level, logging.INFO))
+    if args.resolve_clients and not args.track_clients:
+        logger.warning("--resolve-clients has no effect without --track-clients")
+    elif args.resolve_clients:
+        CLIENT_RESOLVER = ClientNameResolver(ignore=args.client_hostname_ignore)
 
     await verify_ollama_connection()
     config = uvicorn.Config(
@@ -826,14 +1162,18 @@ async def main():
     server = uvicorn.Server(config)
 
     sock = bind_listen_socket(args.host, args.port)
-    if sock is None:
-        await server.serve()
-    else:
-        # serve(sockets=...) skips uvicorn's own bind, so our socket options
-        # survive.
-        families = "IPv6+IPv4" if sock.family == socket.AF_INET6 else "IPv4"
-        logger.info(f"Listening on {sock.getsockname()[0]}:{args.port} ({families})")
-        await server.serve(sockets=[sock])
+    try:
+        if sock is None:
+            await server.serve()
+        else:
+            # serve(sockets=...) skips uvicorn's own bind, so our socket
+            # options survive.
+            families = "IPv6+IPv4" if sock.family == socket.AF_INET6 else "IPv4"
+            logger.info(f"Listening on {sock.getsockname()[0]}:{args.port} ({families})")
+            await server.serve(sockets=[sock])
+    finally:
+        if CLIENT_RESOLVER is not None:
+            CLIENT_RESOLVER.close()
 
 if __name__ == "__main__":
     try:

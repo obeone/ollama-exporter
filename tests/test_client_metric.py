@@ -75,6 +75,12 @@ class _FakeUpstream:
         """Nothing to release."""
 
 
+@pytest.fixture(autouse=True)
+def _no_resolver(monkeypatch):
+    """Make sure no resolver leaked from elsewhere: hostname must equal client."""
+    monkeypatch.setattr(ollama_exporter, "CLIENT_RESOLVER", None)
+
+
 def _send_chat(monkeypatch, trusted_hosts, forwarded_for=None, peer=PEER, path="/api/chat"):
     """Post one chat request to the app as seen from ``PEER``.
 
@@ -119,6 +125,8 @@ _REAL_CLIENT = httpx.AsyncClient
 def _count(client):
     """Read the per-client counter for model ``m`` and the given label.
 
+    With resolution off the ``hostname`` label equals ``client``.
+
     Parameters
     ----------
     client : str
@@ -130,7 +138,8 @@ def _count(client):
         Current sample value, ``0.0`` when the series does not exist yet.
     """
     value = REGISTRY.get_sample_value(
-        "ollama_client_requests_total", {"model": "m", "client": client}
+        "ollama_client_requests_total",
+        {"model": "m", "client": client, "hostname": client},
     )
     return value or 0.0
 
