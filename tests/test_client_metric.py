@@ -11,7 +11,6 @@ import asyncio
 import httpx
 import pytest
 from prometheus_client import REGISTRY
-from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 import ollama_exporter
 
@@ -24,7 +23,7 @@ def test_parse_args_defaults(monkeypatch):
     monkeypatch.delenv("FORWARDED_ALLOW_IPS", raising=False)
     args = ollama_exporter.parse_args([])
     assert args.track_clients is False
-    assert args.forwarded_allow_ips == "127.0.0.1"
+    assert args.forwarded_allow_ips == "127.0.0.1,::1"
 
 
 @pytest.mark.parametrize("value", ["1", "true", "TRUE", "Yes", "on"])
@@ -77,7 +76,7 @@ class _FakeUpstream:
         return httpx.Response(200, json={"message": {"content": "hi"}, "done": True})
 
 
-def _send_chat(monkeypatch, trusted_hosts, forwarded_for=None):
+def _send_chat(monkeypatch, trusted_hosts, forwarded_for=None, peer=PEER, path="/api/chat"):
     """Post one chat request to the app as seen from ``PEER``.
 
     Parameters
@@ -89,19 +88,24 @@ def _send_chat(monkeypatch, trusted_hosts, forwarded_for=None):
         ``--forwarded-allow-ips``.
     forwarded_for : str, optional
         Value of the ``X-Forwarded-For`` header to send, if any.
+    peer : str, optional
+        Direct peer address presented to the app.
+    path : str, optional
+        Endpoint to post to.
     """
     monkeypatch.setattr(ollama_exporter.httpx, "AsyncClient", _FakeUpstream)
-    wrapped = ProxyHeadersMiddleware(ollama_exporter.app, trusted_hosts=trusted_hosts)
+    # The exact stack main() hands to uvicorn.
+    wrapped = ollama_exporter.build_asgi_app(trusted_hosts)
 
     async def run():
         """Drive the request through the ASGI stack with a fixed peer."""
-        transport = httpx.ASGITransport(app=wrapped, client=(PEER, 1234))
+        transport = httpx.ASGITransport(app=wrapped, client=(peer, 1234))
         # The stub replaces httpx.AsyncClient globally, so the test client
         # must be the class captured before any patching.
         async with _REAL_CLIENT(transport=transport, base_url="http://test") as client:
             headers = {"X-Forwarded-For": forwarded_for} if forwarded_for else {}
             response = await client.post(
-                "/api/chat", json={"model": "m", "stream": False}, headers=headers
+                path, json={"model": "m", "stream": False}, headers=headers
             )
             assert response.status_code == 200
 
@@ -132,11 +136,12 @@ def _count(client):
     return value or 0.0
 
 
-def test_trusted_peer_forwarded_address_is_the_label(monkeypatch):
+@pytest.mark.parametrize("path", ["/api/chat", "/api/generate"])
+def test_trusted_peer_forwarded_address_is_the_label(monkeypatch, path):
     """A trusted proxy's X-Forwarded-For becomes the client label."""
     monkeypatch.setattr(ollama_exporter, "TRACK_CLIENTS", True)
     before = _count("203.0.113.7")
-    _send_chat(monkeypatch, PEER, "203.0.113.7")
+    _send_chat(monkeypatch, PEER, "203.0.113.7", path=path)
     assert _count("203.0.113.7") == before + 1
 
 
@@ -166,3 +171,61 @@ def test_tracking_disabled_does_not_increment(monkeypatch):
     _send_chat(monkeypatch, PEER, "203.0.113.7")
     assert _count("203.0.113.7") == before
     assert _count(PEER) == before_peer
+
+
+def test_ipv4_mapped_trusted_peer_still_matches_ipv4_trust(monkeypatch):
+    """A mapped peer on the dual-stack socket matches an IPv4 CIDR."""
+    monkeypatch.setattr(ollama_exporter, "TRACK_CLIENTS", True)
+    before = _count("203.0.113.7")
+    _send_chat(monkeypatch, "10.0.0.0/8", "203.0.113.7", peer="::ffff:10.0.0.5")
+    assert _count("203.0.113.7") == before + 1
+
+
+def test_ipv4_mapped_direct_client_is_labelled_as_plain_ipv4(monkeypatch):
+    """Without a trusted proxy the label is the unmapped IPv4 peer."""
+    monkeypatch.setattr(ollama_exporter, "TRACK_CLIENTS", True)
+    before = _count("192.0.2.1")
+    _send_chat(monkeypatch, "10.0.0.0/8", peer="::ffff:192.0.2.1")
+    assert _count("192.0.2.1") == before + 1
+    assert _count("::ffff:192.0.2.1") == 0.0
+
+
+def test_main_hands_the_built_stack_to_uvicorn(monkeypatch):
+    """main() passes the wrapped app and proxy_headers=False to uvicorn.Config."""
+    captured = {}
+    sentinel = object()
+
+    class FakeServer:
+        """Server stub whose serve() returns immediately."""
+
+        def __init__(self, config):
+            """Record nothing; the Config call is what matters."""
+
+        async def serve(self, sockets=None):
+            """Pretend to serve, binding nothing."""
+
+    async def noop():
+        """Skip the upstream connectivity check."""
+
+    def fake_config(app, **kwargs):
+        """Capture the arguments main() gives uvicorn.Config."""
+        captured["app"] = app
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(ollama_exporter.uvicorn, "Config", fake_config)
+    monkeypatch.setattr(ollama_exporter.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(ollama_exporter, "verify_ollama_connection", noop)
+    monkeypatch.setattr(ollama_exporter, "bind_listen_socket", lambda h, p: None)
+    monkeypatch.setattr(
+        ollama_exporter, "build_asgi_app", lambda ips: (captured.update(ips=ips), sentinel)[1]
+    )
+    monkeypatch.setattr(ollama_exporter, "TRACK_CLIENTS", False)
+    monkeypatch.setattr("sys.argv", ["ollama_exporter", "--forwarded-allow-ips", "10.0.0.0/8"])
+
+    asyncio.run(ollama_exporter.main())
+
+    assert captured["app"] is sentinel
+    assert captured["ips"] == "10.0.0.0/8"
+    assert captured["kwargs"]["proxy_headers"] is False
+    assert "forwarded_allow_ips" not in captured["kwargs"]
