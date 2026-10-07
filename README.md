@@ -92,10 +92,11 @@ Enable it only on networks where the set of clients is small and known.
 | Flag | Environment variable | Description |
 |------|----------------------|-------------|
 | `--track-clients` | `EXPORTER_TRACK_CLIENTS` | Enable the counter (`1`, `true`, `yes` or `on`) |
-| `--forwarded-allow-ips` | `FORWARDED_ALLOW_IPS` | Comma-separated IPs/CIDRs, or `*`, allowed to set `X-Forwarded-For` (default `127.0.0.1`) |
+| `--forwarded-allow-ips` | `FORWARDED_ALLOW_IPS` | Comma-separated IPs/CIDRs, or `*`, allowed to set `X-Forwarded-For` (default `127.0.0.1,::1`) |
 
 Behind a reverse proxy, the client is read from `X-Forwarded-For`, but only when
-the direct peer is listed in `--forwarded-allow-ips`. Requests from any other
+the direct peer is listed in `--forwarded-allow-ips`. IPv4 peers are matched in
+their plain form even on the default dual-stack socket. Requests from any other
 peer have the header ignored, so a client cannot spoof its address. Trust only
 your own proxies, and avoid `*` unless the exporter is unreachable except
 through them.

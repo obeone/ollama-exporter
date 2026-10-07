@@ -2,11 +2,13 @@ import os
 import argparse
 import asyncio
 import httpx
+import ipaddress
 import json
 import logging
 import socket
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 import uvicorn
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
@@ -18,9 +20,10 @@ DEFAULT_LISTEN_HOST = "::"  # dual-stack: binds both IPv6 and IPv4
 DEFAULT_LISTEN_PORT = 8000
 DEFAULT_LOG_LEVEL = "INFO"
 
-# Only the loopback is trusted to set X-Forwarded-For by default, so a client
-# reaching the exporter directly cannot spoof its address.
-DEFAULT_FORWARDED_ALLOW_IPS = "127.0.0.1"
+# Only the loopback (both families, like uvicorn's own default) is trusted to
+# set X-Forwarded-For, so a client reaching the exporter directly cannot spoof
+# its address.
+DEFAULT_FORWARDED_ALLOW_IPS = "127.0.0.1,::1"
 
 # Values accepted as "true" for boolean environment variables.
 TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -92,6 +95,70 @@ HOP_BY_HOP_HEADERS = frozenset({
     "transfer-encoding",
     "upgrade",
 })
+
+
+class UnmapIPv4Middleware:
+    """Rewrite IPv4-mapped IPv6 peers (``::ffff:a.b.c.d``) to plain IPv4.
+
+    On the dual-stack ``::`` socket the kernel reports IPv4 peers in mapped
+    form. uvicorn's trusted-host check compares that string against the
+    configured IPv4 addresses and CIDRs, so it would never match and
+    ``X-Forwarded-For`` would be silently ignored behind any IPv4 proxy. This
+    middleware must run before :class:`ProxyHeadersMiddleware`.
+
+    Parameters
+    ----------
+    app : callable
+        The wrapped ASGI application.
+    """
+
+    def __init__(self, app):
+        """Store the wrapped ASGI application."""
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        """Unmap the client address in ``scope``, then delegate to the app.
+
+        Parameters
+        ----------
+        scope : dict
+            ASGI connection scope.
+        receive : callable
+            ASGI receive channel.
+        send : callable
+            ASGI send channel.
+        """
+        client = scope.get("client")
+        if client:
+            try:
+                # Only IPv6Address has ipv4_mapped; plain IPv4 yields None here.
+                mapped = getattr(ipaddress.ip_address(client[0]), "ipv4_mapped", None)
+            except ValueError:
+                # Not an IP literal (e.g. a unix socket path): leave untouched.
+                mapped = None
+            if mapped is not None:
+                scope["client"] = (str(mapped), client[1])
+        await self.app(scope, receive, send)
+
+
+def build_asgi_app(forwarded_allow_ips):
+    """Wrap the FastAPI app with the production proxy-header handling.
+
+    Parameters
+    ----------
+    forwarded_allow_ips : str
+        Comma-separated IPs/CIDRs, or ``*``, allowed to set
+        ``X-Forwarded-For``.
+
+    Returns
+    -------
+    callable
+        ASGI app: IPv4 unmapping first, then uvicorn's proxy-headers handling.
+        Pass it to uvicorn with ``proxy_headers=False`` to avoid a second layer.
+    """
+    return UnmapIPv4Middleware(
+        ProxyHeadersMiddleware(app, trusted_hosts=forwarded_allow_ips)
+    )
 
 
 def sanitize_response_headers(headers):
@@ -384,13 +451,13 @@ async def main():
 
     await verify_ollama_connection()
     config = uvicorn.Config(
-        app,
+        build_asgi_app(args.forwarded_allow_ips),
         host=args.host,
         port=args.port,
         log_level=args.log_level.lower(),
-        # uvicorn rewrites request.client from X-Forwarded-For only when the
-        # direct peer matches this list.
-        forwarded_allow_ips=args.forwarded_allow_ips,
+        # build_asgi_app already adds the proxy-headers layer (after unmapping
+        # IPv4-mapped peers); uvicorn's own would be a redundant second one.
+        proxy_headers=False,
     )
     server = uvicorn.Server(config)
 
