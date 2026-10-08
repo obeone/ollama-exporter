@@ -94,11 +94,12 @@ logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 app = FastAPI()
 
 OLLAMA_CHAT_REQUEST_COUNT = Counter("ollama_requests_total", "Total chat requests", ["model"])
-# Optional: only incremented when --track-clients is set. A labelled counter
+# Optional: only incremented, for every inference request (see is_inference()),
+# when --track-clients is set. A labelled counter
 # emits no samples until used, so defining it here costs nothing when disabled.
 OLLAMA_CLIENT_REQUEST_COUNT = Counter(
     "ollama_client_requests_total",
-    "Chat and generate requests per source client",
+    "Inference requests (chat, generate, embeddings, OpenAI-compatible) per source client",
     # `hostname` is always part of the schema (equal to `client` when
     # resolution is off) so the series shape does not depend on a flag.
     ["model", "client", "hostname"],
@@ -973,7 +974,7 @@ async def proxy(request: Request, path: str):
     if request.method == "POST" and endpoint in COUNTED_PATHS:
         OLLAMA_CHAT_REQUEST_COUNT.labels(model=model).inc()
 
-    if TRACK_CLIENTS and request.method == "POST" and endpoint in NATIVE_METRICS_PATHS:
+    if TRACK_CLIENTS and inference:
         # uvicorn's proxy-headers middleware has already replaced
         # request.client with the X-Forwarded-For address when the direct peer
         # is trusted, so no header parsing is needed (or wanted) here.
