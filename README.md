@@ -97,7 +97,7 @@ docker restart <prometheus-container-name>
 | Metric Name | Description |
 |------------|-------------|
 | `ollama_requests_total` | Total chat and generate requests (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`) |
-| `ollama_client_requests_total` | Chat and generate requests per source client (optional, labels `model`, `client`, `hostname`, see [Per-client metrics](#per-client-metrics)) |
+| `ollama_client_requests_total` | Inference requests per source client: chat, generate, embeddings and the OpenAI-compatible `/v1` endpoints (optional, labels `model`, `client`, `hostname`, see [Per-client metrics](#per-client-metrics)) |
 | `ollama_inflight_requests` | Inference requests currently being proxied to Ollama, per model |
 | `ollama_response_seconds` | Total time spent for the response |
 | `ollama_load_duration_seconds` | Time spent loading the model |
@@ -115,8 +115,9 @@ client sets `stream_options.include_usage`.
 
 ## Per-client metrics
 
-`ollama_client_requests_total{model, client, hostname}` counts chat and generate requests
-per source client. It is disabled by default because a client address label has
+`ollama_client_requests_total{model, client, hostname}` counts every inference request
+(chat, generate, embeddings and the OpenAI-compatible `/v1` endpoints) per source
+client. It is disabled by default because a client address label has
 unbounded cardinality and can bloat Prometheus on a busy or exposed instance.
 Enable it only on networks where the set of clients is small and known.
 
