@@ -165,19 +165,41 @@ def test_every_inference_endpoint_is_counted_per_client(monkeypatch, path):
     assert _count("203.0.113.7") == before + 1
 
 
-def test_non_inference_request_is_not_counted_per_client(monkeypatch):
-    """A GET on a listing endpoint never touches the per-client counter."""
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/tags"),
+        ("POST", "/api/show"),
+        ("POST", "/api/pull"),
+        ("POST", "/api/create"),
+    ],
+)
+def test_non_inference_request_is_not_counted_per_client(monkeypatch, method, path):
+    """Listings and model management calls never touch the per-client counter.
+
+    Parameters
+    ----------
+    monkeypatch : pytest.MonkeyPatch
+        Fixture used to enable tracking and stub the upstream client.
+    method : str
+        HTTP method of the non-inference request.
+    path : str
+        Request path, none of which runs a model.
+    """
     monkeypatch.setattr(ollama_exporter, "TRACK_CLIENTS", True)
     monkeypatch.setattr(ollama_exporter.httpx, "AsyncClient", _FakeUpstream)
     before = _count("203.0.113.7")
     wrapped = ollama_exporter.build_asgi_app(PEER)
 
     async def run():
-        """GET /api/tags through the ASGI stack as a trusted proxy's client."""
+        """Send the request through the ASGI stack as a trusted proxy's client."""
         transport = httpx.ASGITransport(app=wrapped, client=(PEER, 1234))
         async with _REAL_CLIENT(transport=transport, base_url="http://test") as client:
-            response = await client.get(
-                "/api/tags", headers={"X-Forwarded-For": "203.0.113.7"}
+            response = await client.request(
+                method,
+                path,
+                json={"model": "m"} if method == "POST" else None,
+                headers={"X-Forwarded-For": "203.0.113.7"},
             )
             assert response.status_code == 200
 
