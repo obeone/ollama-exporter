@@ -204,6 +204,7 @@ docker run -d --name ollama-exporter -p 8000:8000 ollama-exporter \
 | `/api/chat` | POST | Proxies requests to Ollama and logs metrics |
 | `/api/generate` | POST | Proxies requests to Ollama and logs metrics |
 | `/v1/chat/completions`, `/v1/completions` | POST | Proxies requests to Ollama and logs request and token metrics |
+| `/api/embed`, `/api/embeddings`, `/v1/embeddings` | POST | Proxies requests to Ollama and feeds the per-client counter and the in-flight gauge (not `ollama_requests_total`) |
 
 All other endpoints are proxied to the Ollama API.
 
