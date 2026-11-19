@@ -99,19 +99,37 @@ docker restart <prometheus-container-name>
 | `ollama_requests_total` | Total chat and generate requests (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`) |
 | `ollama_client_requests_total` | Inference requests per source client: chat, generate, embeddings and the OpenAI-compatible `/v1` endpoints (optional, labels `model`, `client`, `hostname`, see [Per-client metrics](#per-client-metrics)) |
 | `ollama_inflight_requests` | Inference requests currently being proxied to Ollama, per model |
-| `ollama_response_seconds` | Total time spent for the response |
-| `ollama_load_duration_seconds` | Time spent loading the model |
-| `ollama_prompt_eval_duration_seconds` | Time spent evaluating prompt |
-| `ollama_eval_duration_seconds` | Time spent generating the response |
+| `ollama_response_seconds` | Total time spent for the response (labels `model`, `api`) |
+| `ollama_load_duration_seconds` | Time spent loading the model (native only) |
+| `ollama_prompt_eval_duration_seconds` | Time spent evaluating prompt (native only) |
+| `ollama_eval_duration_seconds` | Time spent generating the response (native only) |
 | `ollama_tokens_processed_total` | Number of tokens in the prompt |
 | `ollama_tokens_generated_total` | Number of tokens in the response |
-| `ollama_tokens_per_second` | Tokens generated per second |
+| `ollama_tokens_per_second` | Tokens generated per second (labels `model`, `api`) |
+| `ollama_time_to_first_token_seconds` | Time from the upstream request to the first generated token (streamed `/v1` only) |
 
-Durations and tokens per second come from Ollama's native stats, so only
-`/api/chat` and `/api/generate` feed them. The OpenAI-compatible
-`/v1/chat/completions` and `/v1/completions` feed the two token counters from
-their `usage` object; for streamed responses that object is only sent when the
-client sets `stream_options.include_usage`.
+### Native vs OpenAI-compatible metrics
+
+Ollama's native endpoints (`/api/chat`, `/api/generate`) report their own
+durations. The OpenAI-compatible ones (`/v1/chat/completions`,
+`/v1/completions`) report none, so the exporter measures them as a proxy.
+
+| Metric | Native (`api="native"`) | OpenAI-compatible (`api="openai"`) |
+|--------|-------------------------|------------------------------------|
+| `ollama_response_seconds` | Ollama's `total_duration` | Proxy wall-clock, from just before the upstream request to the end of the body; streamed or not |
+| `ollama_tokens_per_second` | `eval_count / eval_duration` | Streamed responses only: `(completion_tokens - 1)` over the time between the first and last content chunks. Needs `usage`, so the client must set `stream_options.include_usage` |
+| `ollama_time_to_first_token_seconds` | not fed | Streamed responses only, up to the first chunk with content (reasoning included) |
+| `ollama_tokens_processed_total`, `ollama_tokens_generated_total` | Ollama's counts | The `usage` object (streamed: needs `stream_options.include_usage`) |
+| `ollama_load_duration_seconds`, `ollama_prompt_eval_duration_seconds`, `ollama_eval_duration_seconds` | Ollama's durations | not fed |
+
+Non-streamed `/v1` responses do not feed `ollama_tokens_per_second`: their
+duration includes model load and prompt evaluation, which would skew a
+histogram shared with the native endpoints.
+
+The `api` label exists on the two histograms both APIs feed. Ratios such as
+`load_duration_sum / response_seconds_sum`, or the residual
+`response - eval - prompt_eval - load`, must filter on `{api="native"}`, since
+`/v1` has no load or eval breakdown.
 
 ## Per-client metrics
 
