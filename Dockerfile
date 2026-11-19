@@ -54,6 +54,36 @@ COPY --from=builder /opt/venv /opt/venv
 RUN groupadd -r -g 10001 app && useradd -r -u 10001 -g app app \
     && /usr/local/bin/python -m pip uninstall -y pip
 
+# Keep the two distrusted roots out of the system bundle even if the floating
+# base tag ever ships a ca-certificates that still has them: match them by
+# SHA-256 fingerprint (names change between releases), deselect and delete
+# their files, and rebuild the bundle. A no-op on a current base.
+RUN <<'EOF'
+set -eu
+/usr/local/bin/python - <<'PY'
+import hashlib, pathlib, ssl
+BAD = {
+    "d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4",
+    "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b",
+}
+root = pathlib.Path("/usr/share/ca-certificates")
+drop = {
+    str(p.relative_to(root)) for p in root.rglob("*.crt")
+    if hashlib.sha256(ssl.PEM_cert_to_DER_cert(p.read_text())).hexdigest() in BAD
+}
+conf = pathlib.Path("/etc/ca-certificates.conf")
+conf.write_text("".join(
+    f"!{line}" if line.strip() in drop else line
+    for line in conf.read_text().splitlines(keepends=True)
+))
+# Delete the files too, so a scan of the image does not flag them.
+for name in drop:
+    (root / name).unlink()
+print("deselected:", sorted(drop) or "none")
+PY
+update-ca-certificates --fresh > /dev/null
+EOF
+
 # Application code, owned by the unprivileged user.
 COPY --chown=app:app ollama_exporter.py .
 
