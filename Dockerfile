@@ -22,6 +22,11 @@ COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
 
+# pip is not needed at runtime, and its vendored certifi bundle still ships
+# roots that were distrusted upstream (emSign ECC Root CA G3, Comodo AAA).
+# Drop it from the venv before the venv is copied into the runtime stage.
+RUN pip uninstall -y pip
+
 ###############################################################################
 # Runtime stage — minimal Debian slim image, non-root, app + venv only.
 ###############################################################################
@@ -44,7 +49,10 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 
 # Unprivileged runtime user; high UID/GID avoids collisions with host users.
-RUN groupadd -r -g 10001 app && useradd -r -u 10001 -g app app
+# The base image's own pip goes too, for the same certifi reason as above.
+# Called through the system interpreter, since the venv comes first in PATH.
+RUN groupadd -r -g 10001 app && useradd -r -u 10001 -g app app \
+    && /usr/local/bin/python -m pip uninstall -y pip
 
 # Application code, owned by the unprivileged user.
 COPY --chown=app:app ollama_exporter.py .
