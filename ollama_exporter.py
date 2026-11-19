@@ -106,7 +106,11 @@ OLLAMA_CLIENT_REQUEST_COUNT = Counter(
 )
 OLLAMA_INFLIGHT = Gauge("ollama_inflight_requests", "Inference requests currently proxied to Ollama", ["model"])
 
-OLLAMA_TOTAL_DURATION =       Histogram("ollama_response_seconds", "Total time spent for the response", ["model"])
+# `api` ("native" or "openai") is only on the two histograms both APIs feed.
+# Dashboard ratios such as load_duration_sum / response_seconds_sum and the
+# residual (response - eval - prompt_eval - load) must filter {api="native"},
+# since /v1 has no load/eval breakdown.
+OLLAMA_TOTAL_DURATION =       Histogram("ollama_response_seconds", "Total time spent for the response", ["model", "api"])
 OLLAMA_LOAD_DURATION =        Histogram("ollama_load_duration_seconds", "Time spent loading the model", ["model"])
 OLLAMA_PROMPT_EVAL_DURATION = Histogram("ollama_prompt_eval_duration_seconds", "Time spent evaluating prompt", ["model"])
 OLLAMA_EVAL_DURATION =        Histogram("ollama_eval_duration_seconds", "Time spent generating the response", ["model"])
@@ -117,9 +121,17 @@ OLLAMA_EVAL_COUNT =        Counter("ollama_tokens_generated_total", "Number of t
 OLLAMA_TOKENS_PER_SECOND = Histogram(
     "ollama_tokens_per_second",
     "Tokens generated per second",
-    ["model"],
+    ["model", "api"],
     # Use buckets with suitable ranges for tokens/s measurements
     buckets=[5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+)
+# Only fed for streamed /v1 responses, measured by the proxy (Ollama's OpenAI
+# layer reports no durations). Buckets reach far out to cover cold model loads.
+OLLAMA_TIME_TO_FIRST_TOKEN = Histogram(
+    "ollama_time_to_first_token_seconds",
+    "Time from the upstream request to the first generated token (streamed /v1 only)",
+    ["model"],
+    buckets=[0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120],
 )
 
 
@@ -571,7 +583,7 @@ def extract_and_record_metrics(response_data, model):
 
     if total_duration > 0:
         total_duration_seconds = total_duration / 1_000_000_000
-        OLLAMA_TOTAL_DURATION.labels(model=model).observe(total_duration_seconds)
+        OLLAMA_TOTAL_DURATION.labels(model=model, api="native").observe(total_duration_seconds)
         logger.debug(f"Model: {model}, Total Duration: {total_duration_seconds:.2f} seconds")
     if load_duration > 0:
         load_duration_seconds = load_duration / 1_000_000_000
@@ -593,7 +605,7 @@ def extract_and_record_metrics(response_data, model):
         logger.debug(f"Model: {model}, Eval Count: {eval_count}")
     if eval_duration > 0 and eval_count > 0:
         tps = eval_count / eval_duration * 1_000_000_000
-        OLLAMA_TOKENS_PER_SECOND.labels(model=model).observe(tps)
+        OLLAMA_TOKENS_PER_SECOND.labels(model=model, api="native").observe(tps)
         logger.debug(f"Model: {model}, Tokens per Second: {tps:.2f}")
 
 @app.get("/metrics")
@@ -611,7 +623,8 @@ def record_openai_usage(response_data, model):
     """Record token counts from an OpenAI-compatible (``/v1``) response.
 
     Ollama's OpenAI layer reports no durations, only a ``usage`` object, so
-    only the token counters can be fed from it.
+    only the token counters can be fed from it. The timing histograms of
+    ``/v1`` responses are measured by :class:`MetricsTap` instead.
 
     Parameters
     ----------
@@ -641,6 +654,13 @@ class MetricsTap:
     is still parsed; only the last matching record is kept and recorded once
     the response completes.
 
+    Native responses are recorded from Ollama's own durations. ``/v1``
+    responses carry none, so the tap measures them itself with ``clock``:
+    :meth:`start` stamps the moment the upstream request is sent, :meth:`feed`
+    stamps the arrival of each chunk, and :meth:`finish` derives the
+    end-to-end duration (every ``/v1`` response), the time to first token and
+    the generation rate (streamed responses only).
+
     Parameters
     ----------
     path : str
@@ -649,10 +669,18 @@ class MetricsTap:
         :data:`OPENAI_METRICS_PATHS`, nothing at all for anything else.
     model : str
         Model label to record the metrics under.
+    clock : callable, optional
+        Monotonic clock returning seconds, injectable so tests can fake time.
     """
 
-    def __init__(self, path, model):
+    def __init__(self, path, model, clock=time.monotonic):
         """Initialise an empty tap for one response (see class docstring)."""
+        self._clock = clock
+        self._start = None
+        self._now = None
+        self._streaming = False
+        self._first_content = None
+        self._last_content = None
         if path in NATIVE_METRICS_PATHS:
             self.kind = "native"
         elif path in OPENAI_METRICS_PATHS:
@@ -662,6 +690,10 @@ class MetricsTap:
         self.model = model
         self._buffer = b""
         self._final = None
+
+    def start(self):
+        """Stamp the moment the upstream request is about to be sent."""
+        self._start = self._clock()
 
     def feed(self, chunk):
         """Consume one body chunk.
@@ -673,6 +705,8 @@ class MetricsTap:
         """
         if self.kind is None:
             return
+        # Lines completed by this chunk are attributed to its arrival time.
+        self._now = self._clock()
         self._buffer += chunk
         *lines, self._buffer = self._buffer.split(b"\n")
         for line in lines:
@@ -682,15 +716,74 @@ class MetricsTap:
         """Parse what is left of the body and record the metrics found."""
         if self.kind is None:
             return
+        if self._now is None:
+            self._now = self._clock()
         # A non-streaming body is usually a single line with no trailing newline.
         self._parse(self._buffer)
         self._buffer = b""
+        if self.kind == "openai":
+            self._record_openai_timing()
         if self._final is None:
             return
         if self.kind == "native":
             extract_and_record_metrics(self._final, self.model)
         else:
             record_openai_usage(self._final, self.model)
+
+    def _record_openai_timing(self):
+        """Record the proxy-measured timing histograms of a ``/v1`` response.
+
+        The end-to-end duration is observed for every response. Time to first
+        token and tokens per second only make sense for streams: a plain JSON
+        body only tells when everything was done, and its duration includes
+        model load and prompt evaluation, which would pollute the tokens per
+        second histogram shared with the native endpoints.
+        """
+        if self._start is None:
+            return
+        OLLAMA_TOTAL_DURATION.labels(model=self.model, api="openai").observe(self._clock() - self._start)
+        if not self._streaming or self._first_content is None:
+            return
+        OLLAMA_TIME_TO_FIRST_TOKEN.labels(model=self.model).observe(self._first_content - self._start)
+        usage = self._final.get("usage") if self._final else None
+        completion_tokens = (usage.get("completion_tokens") or 0) if isinstance(usage, dict) else 0
+        interval = self._last_content - self._first_content
+        # The first content chunk lands after its token was produced, so the
+        # interval between first and last chunk spans N-1 tokens; this also
+        # leaves load and prefill out of the rate.
+        if completion_tokens >= 2 and interval > 0:
+            OLLAMA_TOKENS_PER_SECOND.labels(model=self.model, api="openai").observe((completion_tokens - 1) / interval)
+
+    @staticmethod
+    def _has_generated_content(data):
+        """Tell whether an OpenAI chunk carries generated text.
+
+        Parameters
+        ----------
+        data : dict
+            Decoded SSE chunk.
+
+        Returns
+        -------
+        bool
+            ``True`` for a non-empty chat ``delta.content`` or reasoning field,
+            or a non-empty completion ``text``; role-only, empty and
+            usage-only chunks do not count.
+        """
+        choices = data.get("choices")
+        if not isinstance(choices, list):
+            return False
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("text"):
+                return True
+            delta = choice.get("delta")
+            if isinstance(delta, dict) and any(
+                delta.get(key) for key in ("content", "reasoning", "reasoning_content")
+            ):
+                return True
+        return False
 
     def _parse(self, line):
         """Remember ``line`` if it is the record holding the final stats.
@@ -701,7 +794,9 @@ class MetricsTap:
             One body line, an NDJSON record or an SSE ``data:`` field.
         """
         line = line.strip()
-        if self.kind == "openai" and line.startswith(b"data:"):
+        sse = self.kind == "openai" and line.startswith(b"data:")
+        if sse:
+            self._streaming = True
             line = line[len(b"data:"):].strip()
         if not line or line == b"[DONE]":
             return
@@ -713,8 +808,13 @@ class MetricsTap:
             return
         if self.kind == "native" and data.get("done"):
             self._final = data
-        elif self.kind == "openai" and isinstance(data.get("usage"), dict):
-            self._final = data
+        elif self.kind == "openai":
+            if sse and self._has_generated_content(data):
+                if self._first_content is None:
+                    self._first_content = self._now
+                self._last_content = self._now
+            if isinstance(data.get("usage"), dict):
+                self._final = data
 
 
 def is_inference(method, path):
@@ -871,6 +971,7 @@ class UpstreamProxyResponse(Response):
                     self.method, self.url, headers=self.forward_headers,
                     params=self.params, content=self.forward_body,
                 )
+                self.tap.start()
                 upstream = await client.send(request, stream=True)
                 await send({
                     "type": "http.response.start",
